@@ -1,0 +1,9 @@
+__pycache__
+.DS_Store
+datos_ceibal
+graphs
+Datos_WiFi_Ceibal
+buildings_v2
+wireless-learning
+**/data/*.csv
+**/data/*.joblib
