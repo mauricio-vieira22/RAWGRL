@@ -134,7 +134,7 @@ def run_episode(
                 x_dict=hetero_data.x_dict,
                 edge_index_dict=hetero_data.edge_index_dict,
                 edge_attr_dict=hetero_data.edge_attr_dict,
-                batch_dict=hetero_data.batch_dict if hasattr(hetero_data, 'batch_dict') else None
+                batch_dict=None
             )
 
             if stochastic:
