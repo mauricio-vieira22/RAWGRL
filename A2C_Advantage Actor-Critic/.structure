@@ -1,0 +1,232 @@
+================================================================================
+NetROML __v1.1__ – ESTRUCTURA DE CARPETAS
+================================================================================
+
+NIVEL 1: Raíz del Proyecto
+──────────────────────────────────────────────────────────────────────────────
+
+  📄 README.md                       ← Documentación principal
+  📄 OBSERVATION_SPACE.md            ← Especificación técnica de obs. space
+  📄 train.py                        ← 🚀 ENTRY POINT para entrenamiento
+  📄 evaluate.py                     ← 🔍 Evaluación post-entrenamiento
+  .structure                         ← Este archivo (especificación)
+  .gitignore                         ← Archivos a ignorar en git
+
+
+NIVEL 2: CÓDIGO FUENTE (carpetas core)
+──────────────────────────────────────────────────────────────────────────────
+
+  📁 model/                          ← Componentes de Machine Learning
+  │  ├── __init__.py
+  │  ├── network_graph_env.py        ← 🎮 Entorno Gymnasium (Dict-based)
+  │  │                                   CONTIENE: H_t, A_t, features, n_active
+  │  └── gnn_model.py                ← (v0,v0.5,v1) Arquitectura GNN
+  │                                      [NO existe en v1.1]
+  │
+  ├── 📁 simulation/                 ← Núcleo físico y matemático
+  │  ├── __init__.py
+  │  ├── arrival_departure_model.py  ← Generador de eventos Poisson+Exp
+  │  ├── wifi_physics.py             ← Cálculos: RSSI, SINR, rates, ganancias
+  │  └── graph_builder.py            ← (v0,v0.5,v1) Constructor HeteroData
+  │
+  └── 📁 data/                       ← Pipeline de preprocesamiento
+     ├── __init__.py
+     ├── clases.py                   ← Dataclasses: ClientEvent, Block, Distribution
+     ├── preprocessing.py            ← Orquestador principal del pipeline
+     ├── pipeline_preprocesamiento/
+     │  ├── preprocessing.py
+     │  ├── step1_crear_dataset.py   ← Genera dataset inicial
+     │  ├── step2_gain_e_imputer.py  ← Calcula ganancias, imputa faltantes
+     │  ├── step3_mapear_a_blocks.py ← Agrupa en bloques espaciales
+     │  └── step4_block_to_distribution.py ← Convierte a Distribution objects
+
+
+NIVEL 3: DATOS (entrada / salida procesada)
+──────────────────────────────────────────────────────────────────────────────
+
+  📁 data/                           ← ENTRADA: Datos y configuración
+  │  ├── from_mac_to_building_id.csv ← Mapeo de MACs a edificios
+  │  ├── dataset_990_step2.csv       ← Salida Step 2 (ganancias + imputation)
+  │  └── distributions_990.joblib    ← Distribution objects serializados
+
+
+NIVEL 4: SALIDAS (generados durante/post-training)
+──────────────────────────────────────────────────────────────────────────────
+
+  📁 outputs/                        ← TODO lo generado por train/evaluate
+  │
+  ├── 📁 models/                     ← Checkpoints del modelo
+  │  ├── best_model.zip              ← Mejor modelo (SB3 native format)
+  │  ├── final_model.zip             ← Modelo final
+  │  ├── best_model.pt               ← (legacy) PyTorch format
+  │  └── checkpoints/                ← model_ep*.pt (checkpoints)
+  │
+  ├── 📁 logs/                       ← Métricas y registros de entrenamiento
+  │  ├── training_metrics.csv        ← Step-by-step: loss, entropy, grad_norm
+  │  └── ppo_tensorboard/            ← Events de Tensorboard (SB3)
+  │     └── PPO_*/
+  │        └── events.out.tfevents.* ← Raw events para visualización
+  │
+  └── 📁 evaluation/                 ← Análisis post-entrenamiento
+     ├── rollouts/                   ← Datos de rollouts
+     │  └── rollout_*.csv
+     └── figures/                    ← Gráficos generados
+        ├── training_curves.png
+        ├── graph_snapshots/
+        └── ...
+
+
+NIVEL 5: ARCHIVOS ESPECIALES
+──────────────────────────────────────────────────────────────────────────────
+
+  📁 __pycache__/                    ← Bytecode compilado (ignorar)
+  📁 .pytest_cache/                  ← Cache de pytest (ignorar)
+  .gitignore                         ← Define qué ignorar en git
+
+
+================================================================================
+FLUJO DE DATOS
+================================================================================
+
+INPUT (data/)
+    │
+    ▼ data/preprocessing.py
+[Step 1] dataset_990_step2.csv
+    │
+    ▼ data/pipeline_preprocesamiento/*.py
+[Step 4] distributions_990.joblib
+    │
+    ▼ train.py → model/network_graph_env.py
+[Gymnasium Environment con H_t, A_t, features]
+    │
+    ▼ simulation/* (physics, arrivals)
+[Rewards, rates, SINR]
+    │
+    ▼ PPO training (SB3)
+    │
+    ▼ outputs/models/best_model.zip (SALIDA 1)
+    ▼ outputs/logs/training_metrics.csv (SALIDA 2)
+    ▼ outputs/logs/ppo_tensorboard/ (SALIDA 3)
+
+
+================================================================================
+TIPO DE ARCHIVO POR CARPETA
+================================================================================
+
+model/
+  ├── .py files    → Código ejecutable (Gymnasium env, GNN)
+  └── En v1.1: NO hay gnn_model.py (SB3 usa MlpPolicy nativa)
+
+simulation/
+  ├── .py files    → Código ejecutable (física, simulación)
+  └── Lógica pura: sin estado externo
+
+data/
+  ├── .py files    → Código de procesamiento
+  ├── .csv files   → Datos procesados (entrada al modelo)
+  └── .joblib files→ Objetos Python serializados
+
+outputs/models/
+  ├── .zip files   → Modelos SB3 (recomendado)
+  ├── .pt files    → Modelos PyTorch (legacy)
+  └── Binarios comprimidos
+
+outputs/logs/
+  ├── .csv files   → Métricas tabulares
+  └── tensorboard/ → Binary events
+
+outputs/evaluation/
+  ├── .csv files   → Datos de rollouts
+  └── .png files   → Gráficos PNG
+
+
+================================================================================
+PATRONES DE IMPORTACIÓN
+================================================================================
+
+Desde train.py:
+  from data.preprocessing import run_pipeline
+  from model.network_graph_env import NetworkGraphEnv
+
+Desde evaluate.py:
+  from stable_baselines3 import PPO
+  from model.network_graph_env import NetworkGraphEnv
+
+Intra-paquete (simulation):
+  from simulation.wifi_physics import crear_grilla, convertir_grilla_a_tensor
+
+
+================================================================================
+TRAZABILIDAD: ¿QUÉ ES CADA COSA?
+================================================================================
+
+¿Archivos .py?
+  └─ Código fuente → en model/, simulation/, data/
+
+¿Archivos .csv?
+  ├─ Entrada: data/*.csv (step2 output, mappings)
+  └─ Salida: outputs/logs/*.csv (training metrics, rollouts)
+
+¿Archivos .pt?
+  └─ Modelos PyTorch (legacy, en outputs/models/)
+
+¿Archivos .zip?
+  └─ Modelos SB3 (nativo, en outputs/models/)
+
+¿Archivos .joblib?
+  └─ Objetos Python serializados (distributions en data/)
+
+¿Archivos .md?
+  ├─ README.md → Documentación general
+  └─ OBSERVATION_SPACE.md → Especificación técnica
+
+¿Eventos de Tensorboard?
+  └─ outputs/logs/ppo_tensorboard/ → Events binarios para visualización
+
+
+================================================================================
+USO TÍPICO
+================================================================================
+
+1. ENTRENAR:
+   $ python train.py --building_id 814 --episodes 200 --timesteps 100
+   
+   Genera:
+   ├── outputs/models/best_model.zip
+   ├── outputs/logs/training_metrics.csv
+   └── outputs/logs/ppo_tensorboard/
+
+2. VISUALIZAR ENTRENAMIENTO (Tensorboard):
+   $ tensorboard --logdir outputs/logs/ppo_tensorboard/
+   
+3. EVALUAR:
+   $ python evaluate.py --model_path outputs/models/best_model.zip
+   
+   Genera:
+   └── outputs/evaluation/
+
+4. ANALIZAR MÉTRICAS:
+   Leer outputs/logs/training_metrics.csv en Excel/Pandas
+
+
+================================================================================
+PRÓXIMAS MEJORAS SUGERIDAS
+================================================================================
+
+[ ] Agregar scripts/ con utilities de plotting (scripts/plot_summary.py)
+[ ] Crear data/raw/ para datos brutos originales (separar de processed/)
+[ ] Agregar CITATION.md si hay papers asociados
+[ ] Crear tests/ para unit tests
+[ ] Documentar hyper-parameters en outputs/logs/config.json (auto-save)
+
+
+================================================================================
+NOTAS FINALES
+================================================================================
+
+• Esta estructura es TRAZABLE: cada carpeta tiene propósito claro
+• MANTENIBLE: separación clara entre código, datos, salidas
+• REPRODUCIBLE: outputs/ se puede limpiar sin afectar código
+• ESCALABLE: fácil agregar nuevas versiones (__v1.2__, __v2__, etc.)
+
+================================================================================
