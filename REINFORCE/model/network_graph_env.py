@@ -119,7 +119,7 @@ class NetworkGraphEnv(gym.Env):
             dtype=torch.long, device=self.device,
         )
         self.tx_powers_dbm = torch.tensor(
-            tx_powers_dbm or [20.0, 17.0, 14.0, 11.0, 8.0],
+            tx_powers_dbm or [20.0, 14.0, 8.0],
             dtype=torch.float32, device=self.device,
         )
         self.n_channels = len(self.available_channels)
@@ -278,7 +278,6 @@ class NetworkGraphEnv(gym.Env):
         terminated = (self.current_step >= self.total_timesteps)
         self._delta_t = self._adm.get_delta_t(self.current_step) if not terminated else 0
 
-        # 4. Info enriquecido (variables del estado Markoviano completo)
         t_last = t_end - 1
         n_activos = (~torch.isnan(self._asignaciones[:, t_last, 0])).sum().item() if t_last >= 0 else 0
         eps_list = self._adm.get_epsilon_t(t_last) if t_last >= 0 else []

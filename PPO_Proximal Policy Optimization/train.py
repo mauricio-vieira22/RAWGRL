@@ -42,6 +42,7 @@ except Exception:
     pass
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -92,7 +93,7 @@ def train(args):
 
     # ── Configuración Numérica Base ─────────────────────────────────────────
     available_channels = [1, 6, 11]
-    tx_powers_dbm      = [20.0, 17.0, 14.0, 11.0, 8.0]
+    tx_powers_dbm      = [20.0, 14.0, 8.0]
     n_aps              = len(distributions[0].blocks[0].datos)
     print(f"[Topología] Nodos Access Point Detectados (N): {n_aps}\n")
 
@@ -106,6 +107,7 @@ def train(args):
         decision_period=args.decision_period,
         available_channels=available_channels,
         tx_powers_dbm=tx_powers_dbm,
+        sticky_mode=args.sticky_mode,
         random_seed=args.seed,
         device=device,
     )
@@ -175,6 +177,7 @@ def train(args):
                 logprob_sum = ch_dist.log_prob(ch_acts).sum() + pwr_dist.log_prob(pwr_acts).sum()
 
             obs, float_reward, terminated, truncated, info = env.step(action)
+            float_reward = float_reward / args.reward_scale
             done = terminated or truncated
 
             actions_list.append(action)
@@ -304,13 +307,17 @@ def train(args):
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
-                loss.backward()
-                grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
-                optimizer.step()
-                
-                total_policy_loss += pg_loss.item()
-                total_value_loss += v_loss.item()
-                total_entropy_loss += entropy_loss.item()
+                # Guard: no propagar NaN al modelo si la loss no es finita (episodio sin clientes).
+                if torch.isfinite(loss):
+                    loss.backward()
+                    grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
+                    optimizer.step()
+                else:
+                    grad_norm = torch.tensor(0.0, device=device)
+
+                total_policy_loss  += pg_loss.item() if math.isfinite(pg_loss.item()) else 0.0
+                total_value_loss   += v_loss.item()  if math.isfinite(v_loss.item())  else 0.0
+                total_entropy_loss += entropy_loss.item() if math.isfinite(entropy_loss.item()) else 0.0
                 updates_count += 1
 
         scheduler.step()
@@ -397,7 +404,9 @@ def parse_args():
     p.add_argument("--decision_period", type=int, default=1)
     p.add_argument("--arrival_rate",  type=float, default=2.0)
     p.add_argument("--mean_dur",      type=float, default=10.0)
+    p.add_argument("--sticky_mode",   type=str,   default="sticky", choices=["full", "sticky", "lite"])
     p.add_argument("--hidden",        type=int,   default=64)
+    p.add_argument("--reward_scale",  type=float, default=1.0)
     p.add_argument("--seed",          type=lambda x: None if str(x).lower() == 'none' else int(x), default=None)
     p.add_argument("--save_dir",      default="outputs/models")
     

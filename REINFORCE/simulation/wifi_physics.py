@@ -382,4 +382,8 @@ def calcular_reward(rate_t: torch.Tensor) -> float:
     -------
     float — Reward escalar $R_\tau$ (suma de tasas del slot $t$).
     """
-    return rate_t.nansum().item()
+    if rate_t.numel() == 0 or torch.all(torch.isnan(rate_t)):
+        return 0.0
+    # Average Rate: Optimiza la calidad de servicio promedio, independizando
+    # el reward de la cantidad absoluta de clientes (promueve fairness y aísla la política).
+    return rate_t.nanmean().item()

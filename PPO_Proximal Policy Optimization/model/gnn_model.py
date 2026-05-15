@@ -43,7 +43,7 @@ class GNN(torch.nn.Module):
         hidden_channels: int,
         num_aps:         int,
         out_channels_ch:  int = 3,   # número de canales disponibles
-        out_channels_pwr: int = 5,   # número de potencias disponibles
+        out_channels_pwr: int = 3,   # número de potencias disponibles
     ):
         super().__init__()
         self.num_aps = num_aps
@@ -89,21 +89,25 @@ class GNN(torch.nn.Module):
         # 1. Encode
         x = {}
         x['ap'] = self.ap_encoder(x_dict['ap'])
-        if 'client' in x_dict:
+        if 'client' in x_dict and x_dict['client'].shape[0] > 0:
             x['client'] = self.client_encoder(x_dict['client'])
+        else:
+            # Grafo vacío (sin clientes activos): AP opera sin información de carga.
+            x['client'] = x_dict['ap'].new_zeros((0, x['ap'].shape[-1]))
 
         # 2. Convoluciones (edge_attr_dict puede ser None o dict)
+        # nan_to_num garantiza que GATv2Conv con grafos vacíos no propague NaN a los APs.
         ea = edge_attr_dict or {}
         x = self.conv1(x, edge_index_dict, ea)
-        x = {k: F.elu(v) for k, v in x.items()}
+        x = {k: F.elu(v.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)) for k, v in x.items()}
 
         x = self.conv2(x, edge_index_dict, ea)
-        x = {k: F.elu(v) for k, v in x.items()}
+        x = {k: F.elu(v.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)) for k, v in x.items()}
 
-        # 3. Cabezas de política
+        # 3. Cabezas de política — nan_to_num final como guardia de seguridad
         ap_emb = x['ap']
-        channel_logits = self.channel_head(ap_emb)
-        power_logits = self.power_head(ap_emb)
+        channel_logits = self.channel_head(ap_emb).nan_to_num(nan=0.0)
+        power_logits   = self.power_head(ap_emb).nan_to_num(nan=0.0)
 
         # 4. Cabeza de Valor (Critic, para PPO)
         # Pooling global de APs para obtener 1 valor por grafo
@@ -111,9 +115,8 @@ class GNN(torch.nn.Module):
             from torch_geometric.nn import global_mean_pool
             graph_emb = global_mean_pool(ap_emb, batch_dict['ap'])
         else:
-            # Asumimos que es un solo grafo si no hay batch_dict
             graph_emb = ap_emb.mean(dim=0, keepdim=True)
-            
-        state_value = self.value_head(graph_emb)
+
+        state_value = self.value_head(graph_emb).nan_to_num(nan=0.0)
 
         return channel_logits, power_logits, state_value

@@ -119,7 +119,7 @@ class NetworkGraphEnv(gym.Env):
             dtype=torch.long, device=self.device,
         )
         self.tx_powers_dbm = torch.tensor(
-            tx_powers_dbm or [20.0, 17.0, 14.0, 11.0, 8.0],
+            tx_powers_dbm or [20.0, 14.0, 8.0],
             dtype=torch.float32, device=self.device,
         )
         self.n_channels = len(self.available_channels)

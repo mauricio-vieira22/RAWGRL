@@ -132,7 +132,7 @@ def construir_grafo_timestep(
     band_safe  = banda_t.nan_to_num(0).long()
     rssi_propio = grilla_RSSI[activos_idx, t, ap_activos, band_safe]  # (U_t,)
     # Normalizar al rango [0,1]: rango útil [-100, -30] dBm → shift +100 / 70
-    rssi_propio_norm = ((rssi_propio + 100.0) / 70.0).clamp(0.0, 1.0)
+    rssi_propio_norm = ((rssi_propio + 100.0) / 70.0).clamp(0.0, 1.0)   # duda
 
     data['client'].x = torch.stack(
         [banda_norm, epsilon_t_norm, rate_norm, rssi_propio_norm], dim=1

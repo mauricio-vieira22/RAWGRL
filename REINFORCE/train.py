@@ -35,6 +35,7 @@ except Exception: pass
 
 import argparse
 import logging
+import math
 import sys
 import time
 from pathlib import Path
@@ -135,7 +136,7 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
     
     # Parámetros físicos estandarizados
     available_channels = [1, 6, 11]
-    tx_powers_dbm      = [20.0, 17.0, 14.0, 11.0, 8.0]
+    tx_powers_dbm      = [20.0, 14.0, 8.0]
     n_aps              = len(distributions[0].blocks[0].datos)
 
     # 2. Inicialización del Entorno y Modelo
@@ -148,6 +149,7 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         decision_period=args.decision_period,
         available_channels=available_channels,
         tx_powers_dbm=tx_powers_dbm,
+        sticky_mode=args.sticky_mode,
         random_seed=args.seed,
         device=device,
     )
@@ -203,13 +205,19 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
             obs, reward, terminated, truncated, info = env.step(action)
             done = terminated or truncated
 
-            rewards.append(reward)
+            rewards.append(reward/1000)
             ep_rates.append(info.get("total_rate", 0.0))
 
         # Cómputo de Pérdida Algorítmica (REINFORCE + Entropy Bonus)
         returns    = compute_returns(rewards, gamma=args.gamma).to(device)
         G_0        = returns[0].item()
-        baseline   = G_0 if episode == 0 else 0.95 * baseline + 0.05 * G_0
+
+        # Guard: proteger el baseline de contaminación NaN.
+        # Si el episodio no tuvo clientes activos (reward=0 es válido, pero
+        # una EMA con NaN infecta para siempre todos los episodios siguientes).
+        if math.isfinite(G_0):
+            baseline = G_0 if episode == 0 else 0.95 * baseline + 0.05 * G_0
+
         advantages = normalize_advantages(returns - baseline)
 
         log_probs_t = torch.stack(log_probs)
@@ -220,10 +228,14 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         policy_loss   = loss_actor - entropy_bonus
 
         # Optimización y Estabilización de Gradientes
+        # Guard: no propagar NaN al modelo si la loss no es finita.
         optimizer.zero_grad()
-        policy_loss.backward()
-        pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if torch.isfinite(policy_loss):
+            policy_loss.backward()
+            pre_clip_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        else:
+            pre_clip_norm = torch.tensor(0.0)
         scheduler.step()
 
         # Gestión de Persistencia y Métricas
@@ -279,14 +291,15 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--building_id",  default="990")
     p.add_argument("--save_dir",     default="outputs/models")
     p.add_argument("--seed",         type=int,   default=314)
-    p.add_argument("--episodes",     type=int,   default=500)
-    p.add_argument("--timesteps",    type=int,   default=100)
-    p.add_argument("--arrival_rate", type=float, default=3.0)
-    p.add_argument("--mean_dur",     type=float, default=15.0)
-    p.add_argument("--decision_period", type=int, default=10)
+    p.add_argument("--episodes",     type=int,   default=300)
+    p.add_argument("--timesteps",    type=int,   default=10)
+    p.add_argument("--arrival_rate", type=float, default=2.0)
+    p.add_argument("--mean_dur",     type=float, default=10.0)
+    p.add_argument("--decision_period", type=int, default=1)
+    p.add_argument("--sticky_mode",  type=str,   default="sticky", choices=["full", "sticky", "lite"])
     p.add_argument("--hidden",       type=int,   default=64)
     p.add_argument("--lr",           type=float, default=3e-4)
-    p.add_argument("--gamma",        type=float, default=0.99)
+    p.add_argument("--gamma",        type=float, default=1.0)
     p.add_argument("--entropy_coef", type=float, default=0.01)
     return p.parse_args()
 

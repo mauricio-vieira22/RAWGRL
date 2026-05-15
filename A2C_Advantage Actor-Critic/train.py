@@ -37,6 +37,7 @@ from __future__ import annotations
 import utils.compat  # noqa: F401 — aplica el parche de type_repr
 
 import argparse
+import math
 import os
 import sys
 import time
@@ -73,7 +74,7 @@ def select_device() -> torch.device:
     return torch.device("cpu")
 
 
-def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training: bool):
+def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training: bool, reward_scale: float = 1.0):
     """
     Ejecuta un episodio completo y recolecta trayectorias.
 
@@ -128,7 +129,7 @@ def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training
         obs, reward, terminated, truncated, info = env.step(action)
         done = terminated or truncated
 
-        rewards.append(reward)
+        rewards.append(reward / reward_scale)
         ep_rates.append(info.get("total_rate", 0.0))
 
     return {
@@ -160,7 +161,7 @@ def train(args: argparse.Namespace):
     print(f"[Memoria]  {len(distributions)} instanciaciones cliente-canal cargadas.\n")
 
     available_channels = [1, 6, 11]
-    tx_powers_dbm      = [20.0, 17.0, 14.0, 11.0, 8.0]
+    tx_powers_dbm      = [20.0, 14.0, 8.0]
     n_aps              = len(distributions[0].blocks[0].datos)
 
     # ── Construcción del Entorno de Simulación Electromagnética ─────────────
@@ -173,6 +174,7 @@ def train(args: argparse.Namespace):
         decision_period=args.decision_period,
         available_channels=available_channels,
         tx_powers_dbm=tx_powers_dbm,
+        sticky_mode=args.sticky_mode,
         random_seed=args.seed,
         device=device,
     )
@@ -187,6 +189,7 @@ def train(args: argparse.Namespace):
         decision_period=args.decision_period,
         available_channels=available_channels,
         tx_powers_dbm=tx_powers_dbm,
+        sticky_mode=args.sticky_mode,
         random_seed=(args.seed + 9999) if args.seed is not None else None,
         device=device,
     )
@@ -219,7 +222,7 @@ def train(args: argparse.Namespace):
         env._adm.random_seed = current_seed
 
         model.train()
-        traj = run_episode(env, model, device, training=True)
+        traj = run_episode(env, model, device, training=True, reward_scale=args.reward_scale)
 
         rewards   = traj["rewards"]
         log_probs = traj["log_probs"]
@@ -259,11 +262,14 @@ def train(args: argparse.Namespace):
         total_loss = loss_actor + args.vf_coef * loss_critic + args.entropy_coef * loss_entropy
 
         # ── Backpropagation y Gradient Clipping ───────────────────────────────
+        # Guard: no propagar NaN al modelo si la loss no es finita (episodio sin clientes).
         optimizer.zero_grad()
-        total_loss.backward()
-        # Restricción de norma L2 ($\| g \|_2 \leq 1.0$) para mitigar la inestabilidad por "Exploding Gradients".
-        grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-        optimizer.step()
+        if torch.isfinite(total_loss):
+            total_loss.backward()
+            grad_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+        else:
+            grad_norm = torch.tensor(0.0)
         scheduler.step()
 
         G_train = returns_t[0].item()
@@ -272,7 +278,7 @@ def train(args: argparse.Namespace):
         G_val = float("nan")
         if (episode + 1) % args.eval_every == 0 or episode == 0:
             model.eval()
-            val_traj = run_episode(env_eval, model, device, training=False)
+            val_traj = run_episode(env_eval, model, device, training=False, reward_scale=args.reward_scale)
             G_val = compute_returns(val_traj["rewards"], gamma=args.gamma)[0].item()
 
             if G_val > best_G_val:
@@ -312,14 +318,14 @@ def train(args: argparse.Namespace):
 
     print(f"\n{'='*70}")
     duracion = time.time() - t_global_start
-    print(f"  🏁 Entrenamiento Exitoso  |  Llevó: {duracion/60:.1f} m  | Mejor G_val: {best_G_val:.2f}")
+    print(f"Entrenamiento Exitoso  |  Llevó: {duracion/60:.1f} m  | Mejor G_val: {best_G_val:.2f}")
 
     torch.save(model.state_dict(), save_dir / "final_model.pt")
     df_metrics = pd.DataFrame(metrics)
     metrics_path = save_dir / "training_metrics.csv"
     df_metrics.to_csv(metrics_path, index=False)
-    print(f"  💾 Modelos alojados en: {save_dir}/")
-    print(f"  💾 Métricas crudas en:  {metrics_path}")
+    print(f"Modelos alojados en: {save_dir}/")
+    print(f"Métricas crudas en:  {metrics_path}")
     print(f"{'='*70}\n")
 
     # Generación Automática de Gráficas (Thesis Standard)
@@ -344,12 +350,14 @@ def parse_args():
     p.add_argument("--building_id",   default="990",                           type=str)
     p.add_argument("--dist_joblib",   default="data/distributions_990.joblib", type=str)
     p.add_argument("--step2_csv",     default="data/dataset_990_step2.csv",    type=str)
-    p.add_argument("--episodes",      type=int,   default=200)
+    p.add_argument("--episodes",      type=int,   default=500)
     p.add_argument("--timesteps",     type=int,   default=100)
     p.add_argument("--arrival_rate",  type=float, default=2.0)
     p.add_argument("--mean_dur",      type=float, default=10.0)
     p.add_argument("--decision_period", type=int, default=1)
+    p.add_argument("--sticky_mode",   type=str,   default="sticky", choices=["full", "sticky", "lite"])
     p.add_argument("--hidden",        type=int,   default=64)
+    p.add_argument("--reward_scale",  type=float, default=1.0)
     p.add_argument("--lr",            type=float, default=3e-4)
     p.add_argument("--gamma",         type=float, default=0.99)
     p.add_argument("--entropy_coef",  type=float, default=0.01,
