@@ -136,7 +136,7 @@ def validate_distributions(distributions: list, building_id: str) -> None:
             f"Eliminá el caché CSV y el .joblib y regenerá."
         )
 
-    # Verificar ausencia de -inf en grillas (bug de rssi_fill legacy)
+    # Verificar ausencia de -inf en grillas
     sample_datos = distributions[0].blocks[0].datos
     for col in ["G_2_4", "G_5"]:
         if col in sample_datos.columns:

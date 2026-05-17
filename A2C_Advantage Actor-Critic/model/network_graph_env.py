@@ -88,14 +88,13 @@ class NetworkGraphEnv(gym.Env):
         umbral_5g:          float           = UMBRAL_5G,
         umbral_conexion:    float           = UMBRAL_CONEXION,
         sticky_mode:        StickyMode      = STICKY_STD,
-        # Retrocompatibilidad: sticky=True → STICKY_STD, sticky=False → STICKY_LITE
         sticky:             bool | None     = None,
         random_seed:        int | None      = None,
+        use_5g:             bool            = True,
         device:             torch.device | str = "cpu",
     ):
         super().__init__()
 
-        # Retrocompatibilidad booleana
         if sticky is not None:
             sticky_mode = STICKY_STD if sticky else STICKY_LITE
 
@@ -105,13 +104,13 @@ class NetworkGraphEnv(gym.Env):
         self.mean_duration   = mean_duration
         self.total_timesteps = total_timesteps
         # Cada decisión RL mantiene X_t fijo por `decision_period` slots (LaTeX §RL).
-        # decision_period=1 reproduce el comportamiento legacy (acción por slot).
         self.decision_period = max(int(decision_period), 1)
         self.sigma_dbm       = sigma_dbm
         self.umbral_5g       = umbral_5g
         self.umbral_conexion = umbral_conexion
         self.sticky_mode     = sticky_mode
         self.random_seed     = random_seed
+        self.use_5g          = use_5g
         self.device          = torch.device(device)
 
         self.available_channels = torch.tensor(
@@ -202,6 +201,7 @@ class NetworkGraphEnv(gym.Env):
             umbral_5g=self.umbral_5g,
             umbral_conexion=self.umbral_conexion,
             sticky_mode=self.sticky_mode,
+            use_5g=self.use_5g,
         )
         self._asignaciones[:, 0:1, :] = asig_t0
 
@@ -257,6 +257,7 @@ class NetworkGraphEnv(gym.Env):
                 umbral_conexion=self.umbral_conexion,
                 sticky_mode=self.sticky_mode,
                 estado_previo=self._estado_sticky,
+                use_5g=self.use_5g,
             )
             self._asignaciones[:, t:t+1, :] = asig_t
 
@@ -278,7 +279,6 @@ class NetworkGraphEnv(gym.Env):
         terminated = (self.current_step >= self.total_timesteps)
         self._delta_t = self._adm.get_delta_t(self.current_step) if not terminated else 0
 
-        # 4. Info enriquecido (variables del estado Markoviano completo)
         t_last = t_end - 1
         n_activos = (~torch.isnan(self._asignaciones[:, t_last, 0])).sum().item() if t_last >= 0 else 0
         eps_list = self._adm.get_epsilon_t(t_last) if t_last >= 0 else []
@@ -320,6 +320,7 @@ class NetworkGraphEnv(gym.Env):
             t=t,
             asignaciones=self._asignaciones,
             grilla_RSSI=self._grilla_RSSI,
+            grilla_ganancias=self._grilla_gan,
             decisiones_APs=self._decisiones_APs,
             avg_rates=self._avg_rates,
             eventos=self._eventos,

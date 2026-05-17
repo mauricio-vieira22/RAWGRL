@@ -95,7 +95,6 @@ def convertir_grilla_a_tensor(grilla: np.ndarray) -> torch.Tensor:
                 )
                 out[i, j] = vals
                 
-    # Normalizar: -inf → NaN (compatibilidad con .joblib legacy)
     out = torch.nan_to_num(out, nan=float('nan'), posinf=float('nan'), neginf=float('nan'))
     return out
 
@@ -132,8 +131,8 @@ def asignaciones_AP(
     umbral_conexion: float = UMBRAL_CONEXION,
     sticky_mode: StickyMode = STICKY_STD,
     estado_previo=None,
-    # Retrocompatibilidad: sticky=True → STICKY_STD, sticky=False → STICKY_LITE
     sticky: bool | None = None,
+    use_5g: bool = True,
 ):
     """
     Implementa los tres modelos de conexión del LaTeX (§ Dinámica).
@@ -157,37 +156,46 @@ def asignaciones_AP(
     asignaciones  : Tensor (n_cli, T, 3)  — [ap_idx, band_idx, RSSI_dBm], NaN=inactivo
     ultimo_estado : tuple(Tensor, Tensor) — estado sticky para el siguiente step
     """
-    # Retrocompatibilidad booleana
     if sticky is not None:
         sticky_mode = STICKY_STD if sticky else STICKY_LITE
 
     n_cli, T, n_APs, _ = grilla_RSSI.shape
     dev = grilla_RSSI.device
 
-    # ── AP ideal por timestep: preferir 5 GHz si supera θ_{5G} ──────────────
-    rssi_5g = grilla_RSSI[:, :, :, 1]
-    # BUGFIX: torch.max propaga NaNs. Usamos un valor centinela muy bajo para el cálculo.
-    rssi_5g_safe = rssi_5g.nan_to_num(-200.0)
-    max_5g, argmax_5g = rssi_5g_safe.max(dim=2)
+    # ── AP ideal por timestep ────────────────────────────────────────────────
+    if not use_5g:
+        # Modo forzado 2.4 GHz: ignoramos completamente la banda 5 GHz
+        rssi_24 = grilla_RSSI[:, :, :, 0]
+        max_all, argmax_all_ap = rssi_24.nan_to_num(-200.0).max(dim=2)
+        
+        mask_active = (max_all >= umbral_conexion)
+        
+        ideal_ap   = argmax_all_ap.float().masked_fill(~mask_active, float('nan'))
+        ideal_band = torch.zeros_like(ideal_ap)  # Siempre banda 0
+        ideal_rssi = max_all.masked_fill(~mask_active, float('nan'))
+    else:
+        # Modo Doble Banda (por defecto): preferir 5 GHz si supera θ_{5G}
+        rssi_5g = grilla_RSSI[:, :, :, 1]
+        rssi_5g_safe = rssi_5g.nan_to_num(-200.0)
+        max_5g, argmax_5g = rssi_5g_safe.max(dim=2)
 
-    flat = grilla_RSSI.reshape(n_cli, T, n_APs * 2)
-    flat_safe = flat.nan_to_num(-200.0)
-    max_all, argmax_flat = flat_safe.max(dim=2)
-    
-    argmax_all_ap   = argmax_flat // 2
-    argmax_all_band = argmax_flat % 2
+        flat = grilla_RSSI.reshape(n_cli, T, n_APs * 2)
+        flat_safe = flat.nan_to_num(-200.0)
+        max_all, argmax_flat = flat_safe.max(dim=2)
+        
+        argmax_all_ap   = argmax_flat // 2
+        argmax_all_band = argmax_flat % 2
 
-    # Una posición es válida si existe al menos un AP por encima del umbral de conexión
-    mask_active = (max_all >= umbral_conexion)
+        mask_active = (max_all >= umbral_conexion)
 
-    argmax_5g_f       = argmax_5g.float().masked_fill(~mask_active, float('nan'))
-    argmax_all_ap_f   = argmax_all_ap.float().masked_fill(~mask_active, float('nan'))
-    argmax_all_band_f = argmax_all_band.float().masked_fill(~mask_active, float('nan'))
+        argmax_5g_f       = argmax_5g.float().masked_fill(~mask_active, float('nan'))
+        argmax_all_ap_f   = argmax_all_ap.float().masked_fill(~mask_active, float('nan'))
+        argmax_all_band_f = argmax_all_band.float().masked_fill(~mask_active, float('nan'))
 
-    cumple_5g  = (max_5g >= umbral_5g) & mask_active
-    ideal_ap   = torch.where(cumple_5g, argmax_5g_f,   argmax_all_ap_f)
-    ideal_band = torch.where(cumple_5g, torch.ones_like(argmax_5g_f), argmax_all_band_f)
-    ideal_rssi = torch.where(cumple_5g, max_5g, max_all).masked_fill(~mask_active, float('nan'))
+        cumple_5g  = (max_5g >= umbral_5g) & mask_active
+        ideal_ap   = torch.where(cumple_5g, argmax_5g_f,   argmax_all_ap_f)
+        ideal_band = torch.where(cumple_5g, torch.ones_like(argmax_5g_f), argmax_all_band_f)
+        ideal_rssi = torch.where(cumple_5g, max_5g, max_all).masked_fill(~mask_active, float('nan'))
 
     # ── Modo LITE: siempre el mejor AP disponible ─────────────────────────────
     if sticky_mode == STICKY_LITE:
@@ -249,7 +257,6 @@ def db_to_linear(x: torch.Tensor) -> torch.Tensor:
     
     Maneja NaNs y valores extremos para evitar inestabilidad numérica.
     """
-    # Filtramos nans para evitar warnings en pow
     mask_nan = torch.isnan(x)
     x_safe = x.nan_to_num(-200.0) # RSSI extremadamente bajo -> ~0 mW
     
@@ -384,7 +391,6 @@ def calcular_reward(rate_t: torch.Tensor) -> float:
     """
     if rate_t.numel() == 0 or torch.all(torch.isnan(rate_t)):
         return 0.0
-    # Average Rate (Proportional Fairness sobre SINR):
-    # Como el rate ya es logarítmico respecto al SINR (Shannon), 
-    # la media de los rates ya promueve fairness estricto.
-    return rate_t.nanmean().item()
+    # Rate Total: Optimiza el Throughput agregado del sistema (LaTeX §RL: sum F(...))
+    # Al usar nansum(), el agente busca maximizar la capacidad servida total del edificio.
+    return rate_t.nansum().item()

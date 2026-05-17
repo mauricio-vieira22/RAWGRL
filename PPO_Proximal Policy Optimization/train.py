@@ -61,15 +61,100 @@ from torch_geometric.nn import global_add_pool
 from data.data_loader import load_distributions
 from model.network_graph_env import NetworkGraphEnv
 from model.gnn_model import GNN
+from model.gnn2_model import GNN2
+
+
+class RandomModel(torch.nn.Module):
+    """Modelo baseline aleatorio compatible con la interfaz PPO (Actor-Critic)."""
+    def __init__(self, n_aps, n_ch, n_pwr):
+        super().__init__()
+        self.dummy = torch.nn.Parameter(torch.zeros(1))
+        self.n_ch  = n_ch
+        self.n_pwr = n_pwr
+
+    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None, batch_dict=None):
+        device = x_dict['ap'].device
+        n_ap = x_dict['ap'].size(0)
+        ch_logits  = torch.zeros((n_ap, self.n_ch), device=device) + self.dummy
+        pwr_logits = torch.zeros((n_ap, self.n_pwr), device=device) + self.dummy
+        
+        # Valor base para el critic
+        if batch_dict is not None and 'ap' in batch_dict:
+            n_graphs = int(batch_dict['ap'].max().item() + 1)
+            value = torch.zeros((n_graphs, 1), device=device) + self.dummy
+        else:
+            value = torch.zeros((1, 1), device=device) + self.dummy
+        return ch_logits, pwr_logits, value
+
+
+import matplotlib
+import matplotlib.pyplot as plt
+import math
+
+class RealTimePlotter:
+    """Graficador interactivo en tiempo real para loss y reward usando GUI local."""
+    def __init__(self, title="RAWGRL (PPO): Real-Time Training Monitor"):
+        plt.ion()  # Habilitar modo interactivo de matplotlib
+        self.fig, self.axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        self.fig.suptitle(title, fontsize=12, fontweight='bold', color='#1e293b')
+        
+        # 1. Panel de Recompensa (Return G_t)
+        self.ax_reward = self.axes[0]
+        self.line_reward, = self.ax_reward.plot([], [], color='#2563eb', linewidth=1.5, label='Train Return ($G_{train}$)')
+        self.line_val, = self.ax_reward.plot([], [], color='#f97316', linestyle='--', linewidth=1.5, label='Val Return ($G_{val}$)')
+        self.ax_reward.set_title("Cumulative Reward (Throughput)", fontsize=10, fontweight='bold')
+        self.ax_reward.set_xlabel("Episode", fontsize=9)
+        self.ax_reward.set_ylabel("Reward", fontsize=9)
+        self.ax_reward.grid(True, linestyle=':', alpha=0.6)
+        self.ax_reward.legend(loc='upper left', fontsize=8)
+        
+        # 2. Panel de Pérdida (Policy Loss)
+        self.ax_loss = self.axes[1]
+        self.line_loss, = self.ax_loss.plot([], [], color='#dc2626', linewidth=1.5, label='Policy Loss')
+        self.ax_loss.set_title("Optimization: Policy Loss", fontsize=10, fontweight='bold')
+        self.ax_loss.set_xlabel("Episode", fontsize=9)
+        self.ax_loss.set_ylabel("Loss", fontsize=9)
+        self.ax_loss.grid(True, linestyle=':', alpha=0.6)
+        self.ax_loss.legend(loc='upper right', fontsize=8)
+        
+        self.fig.tight_layout()
+        plt.show()
+        
+    def update(self, episodes, returns, val_returns, losses):
+        # 1. Actualizar Recompensas
+        self.line_reward.set_xdata(episodes)
+        self.line_reward.set_ydata(returns)
+        
+        # Filtrar valores NaN de la validación periódica si están presentes
+        if len(val_returns) > 0 and any(not math.isnan(x) for x in val_returns):
+            val_eps = [ep for ep, val in zip(episodes, val_returns) if not math.isnan(val)]
+            val_y = [val for val in val_returns if not math.isnan(val)]
+            self.line_val.set_xdata(val_eps)
+            self.line_val.set_ydata(val_y)
+        else:
+            self.line_val.set_xdata([])
+            self.line_val.set_ydata([])
+        
+        # 2. Actualizar Loss
+        self.line_loss.set_xdata(episodes)
+        self.line_loss.set_ydata(losses)
+        
+        # Re-escalar vistas de manera automática y dinámica
+        self.ax_reward.relim()
+        self.ax_reward.autoscale_view()
+        
+        self.ax_loss.relim()
+        self.ax_loss.autoscale_view()
+        
+        # Redibujar canvas y procesar eventos GUI del sistema operativo (macOS Aqua)
+        self.fig.canvas.draw()
+        self.fig.canvas.flush_events()
+        plt.pause(0.001)
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
-def select_device() -> torch.device:
-    if torch.cuda.is_available():
-        return torch.device("cuda")
-    if torch.backends.mps.is_available():
-        return torch.device("mps")
-    return torch.device("cpu")
+
 
 # ─────────────────────────────────────────────────────────────────────────────
 
@@ -80,7 +165,7 @@ def train(args):
     print(f"  PPO Params: clip={args.clip_coef} | epochs={args.update_epochs} | GAE_lambda={args.gae_lambda}")
     print(f"{'='*70}\n")
 
-    device = select_device()
+    device = torch.device("cpu")
     print(f"[Hardware] Dispositivo de Cómputo Tensorial: {device}\n")
 
     # ── Parametrización del POMDP y Carga Estocástica ───────────────────────
@@ -109,16 +194,36 @@ def train(args):
         tx_powers_dbm=tx_powers_dbm,
         sticky_mode=args.sticky_mode,
         random_seed=args.seed,
+        use_5g=not args.no_5g,
         device=device,
     )
 
-    # ── Definición de la Política Neuronal $\pi_\theta$ y Valor $V_\phi$ ────
-    model = GNN(
-        hidden_channels=args.hidden,
-        num_aps=n_aps,
-        out_channels_ch=len(available_channels),
-        out_channels_pwr=len(tx_powers_dbm),
-    ).to(device)
+    # ── Selección de la Arquitectura de Red Neuronal ────────────────────────
+    if args.model_type == "gnn2":
+        print(f"[Arquitectura] Utilizando GNN2 (TAGConv) con K={args.tagconv_k}...")
+        model = GNN2(
+            hidden_channels=args.hidden,
+            num_aps=n_aps,
+            out_channels_ch=len(available_channels),
+            out_channels_pwr=len(tx_powers_dbm),
+            K=args.tagconv_k
+        ).to(device)
+    elif args.model_type == "random":
+        print(f"[Arquitectura] Utilizando Baseline ALEATORIO (Uniforme)...")
+        model = RandomModel(
+            n_aps=n_aps,
+            n_ch=len(available_channels),
+            n_pwr=len(tx_powers_dbm)
+        ).to(device)
+    else:
+        print(f"[Arquitectura] Utilizando GNN1 (GATv2 Heterogéneo)...")
+        model = GNN(
+            hidden_channels=args.hidden,
+            num_aps=n_aps,
+            out_channels_ch=len(available_channels),
+            out_channels_pwr=len(tx_powers_dbm),
+            num_layers=args.num_layers
+        ).to(device)
 
     # En PPO epsilon es usualmente pequeño (1e-5) para mayor estabilidad
     optimizer = optim.AdamW(model.parameters(), lr=args.lr, eps=1e-5)
@@ -131,6 +236,13 @@ def train(args):
     best_rate = -float("inf")
     metrics  = []
     t0       = time.time()
+
+    # Inicializar el graficador interactivo en tiempo real
+    try:
+        plotter = RealTimePlotter()
+    except Exception as e:
+        print(f"[Aviso] No se pudo iniciar la interfaz gráfica en tiempo real: {e}. Continuando sin ventana GUI.")
+        plotter = None
 
     print(f"{'='*85}")
     print(f"{'Ep':<6} | {'Total Rate':>10} | {'G_t':>10} | {'L_policy':>9} | {'L_value':>9} | {'Entropy':>9} | {'Time(s)':>7}")
@@ -307,7 +419,6 @@ def train(args):
                 loss = pg_loss - args.ent_coef * entropy_loss + v_loss * args.vf_coef
 
                 optimizer.zero_grad()
-                # Guard: no propagar NaN al modelo si la loss no es finita (episodio sin clientes).
                 if torch.isfinite(loss):
                     loss.backward()
                     grad_norm = nn.utils.clip_grad_norm_(model.parameters(), args.max_grad_norm)
@@ -354,6 +465,17 @@ def train(args):
             "sec":           ep_dur,
         })
 
+        # Actualizar la interfaz gráfica interactiva en tiempo real (cada episodio)
+        if plotter is not None:
+            try:
+                eps = [m["episode"] for m in metrics]
+                returns = [m["return"] for m in metrics]
+                val_returns = []  # No hay validación periódica registrada en métricas de PPO
+                losses = [m["loss"] for m in metrics]
+                plotter.update(eps, returns, val_returns, losses)
+            except Exception:
+                pass
+
         if (episode + 1) % 10 == 0 or episode == 0:
             print(
                 f"{episode+1:<6} | "
@@ -364,6 +486,25 @@ def train(args):
                 f"{total_entropy_loss/updates_count:>9.4f} | "
                 f"{ep_dur:>7.1f}"
             )
+            # Guardar CSV temporal y actualizar gráficas en tiempo real
+            try:
+                temp_df = pd.DataFrame(metrics)
+                temp_df.to_csv(save_dir / "training_metrics.csv", index=False)
+                import subprocess
+                plot_script = Path(__file__).parent / "plots_code" / "plot_training.py"
+                if plot_script.exists():
+                    subprocess.run(
+                        [
+                            sys.executable, str(plot_script),
+                            "--csv", str(save_dir / "training_metrics.csv"),
+                            "--out", str(Path(__file__).parent / "plots"),
+                        ],
+                        check=False,
+                        stdout=subprocess.DEVNULL,
+                        stderr=subprocess.DEVNULL,
+                    )
+            except Exception:
+                pass
 
     print(f"\n{'='*65}")
     print(f"  Entrenamiento finalizado en {time.time()-t0:.1f}s  |  Mejor Total Rate: {best_rate:.2f}")
@@ -397,15 +538,19 @@ def train(args):
 # ─────────────────────────────────────────────────────────────────────────────
 
 def parse_args():
-    p = argparse.ArgumentParser(description="NetROML – PPO + GNN")
+    p = argparse.ArgumentParser(description="NetROML – PPO Proximal Policy Optimization")
     p.add_argument("--building_id",   default="990")
     p.add_argument("--episodes",      type=int,   default=200)
     p.add_argument("--timesteps",     type=int,   default=100)
     p.add_argument("--decision_period", type=int, default=1)
     p.add_argument("--arrival_rate",  type=float, default=2.0)
     p.add_argument("--mean_dur",      type=float, default=10.0)
+    p.add_argument("--no_5g",         action="store_true", help="Deshabilita el uso de la banda de 5 GHz")
     p.add_argument("--sticky_mode",   type=str,   default="sticky", choices=["full", "sticky", "lite"])
     p.add_argument("--hidden",        type=int,   default=64)
+    p.add_argument("--model_type",    type=str,   default="gnn1", choices=["gnn1", "gnn2", "random"])
+    p.add_argument("--num_layers",    type=int,   default=4)
+    p.add_argument("--tagconv_k",     type=int,   default=5)
     p.add_argument("--reward_scale",  type=float, default=1.0)
     p.add_argument("--seed",          type=lambda x: None if str(x).lower() == 'none' else int(x), default=None)
     p.add_argument("--save_dir",      default="outputs/models")
@@ -418,9 +563,9 @@ def parse_args():
     p.add_argument("--minibatch_size",type=int,   default=64)   # Tamaño del minibatch de grafos
     p.add_argument("--clip_coef",     type=float, default=0.2)  # Surrogate clipping function (epsilon)
     p.add_argument("--ent_coef",      type=float, default=0.01) # Coeficiente de entropía (bonus)
-    p.add_argument("--vf_coef",       type=float, default=0.5)  # Coeficiente del value function
+    p.add_argument("--vf_coef",       type=float, default=0.5)  # Coeficiente del value function (reducido para estabilidad)
     p.add_argument("--max_grad_norm", type=float, default=0.5)  # Global gradient clipping
-    p.add_argument("--norm_adv",      type=bool,  default=True) # Normalizar advantages a nivel de minibatch
+    p.add_argument("--norm_adv", action=argparse.BooleanOptionalAction, default=True)
     
     return p.parse_args()
 

@@ -1,32 +1,39 @@
 r"""
-gnn_model.py – Arquitectura de Red Neuronal de Grafos Heterogénea (GNN).
+gnn_model.py — Arquitectura de Red Neuronal de Grafos Heterogénea (GNN).
 
-Esta red parametrizada actúa como la Política $\pi_\theta(a_t | s_t)$ 
-del algoritmo REINFORCE. Emplea capas `HeteroConv` basadas en convoluciones atencionales (GATv2Conv) 
-para propagar la información electromagnética a través de la topología estricta de la red Wi-Fi.
+Parametriza la política estocástica π_θ(a_t | s_t) del agente REINFORCE sobre
+el grafo bipartito heterogéneo G_t = (V_AP ∪ V_C, E_ac ∪ E_ca ∪ E_aa).
 
-Matemática de Propagación de Mensajes (Message Passing)
--------------------------------------------------------
-La actualización del embedding de cada nodo cliente $u$ en la capa $l+1$ es:
-$$ h_u^{(l+1)} = \sigma \left( \sum_{v \in \mathcal{N}(u)} \alpha_{u,v} \mathbf{W} h_v^{(l)} \right) $$
-Donde $\alpha_{u,v}$ es el coeficiente de atención dictado por el $RSSI_{u,v}$ normalizado (edge_attr).
+Arquitectura
+------------
+La red emplea HeteroConv con GATv2Conv (Brody et al., 2022) en L capas de
+propagación de mensajes, seguida de dos cabezas de política independientes que
+leen exclusivamente los embeddings de nodos AP.
 
-Entradas (por nodo) $X_t$
--------------------------
-AP     : 2 Features [canal_raw, potencia_raw (dBm)]
-Cliente: 4 Features [banda_norm, epsilon_t_norm, avg_rate_norm, rssi_propio_norm]
+    Capa 0: Encoders lineales → h_AP ∈ R^d, h_C ∈ R^d
+    Capas 1..L: HeteroConv con tres relaciones:
+        (AP → Cliente):  E_ac, con edge_attr RSSI normalizado
+        (Cliente → AP):  E_ca, sin edge_attr (asignación binaria)
+        (AP → AP):       E_aa, con edge_attr co-visibilidad normalizada
+    Salida: channel_head(h_AP) → logits ∈ R^{N × |C|}
+            power_head(h_AP)   → logits ∈ R^{N × |P|}
 
-Nota Teórica:
-La carga $|\{u: a_{u,t}=n\}|$ no se incluye como feature explícita del AP
-pues el mecanismo de atención GATv2 sobre las aristas $(\text{Cliente} \to \text{AP})$
-ya agrega la información de todos los clientes conectados durante el message passing.
-$\epsilon_t$ se expone como feature del nodo Cliente para enriquecer la observación local.
-$\delta_t$ se inyecta en la cabeza de decisión en la variante `gnn_delta_model.py`.
+Conexión residual
+-----------------
+Las conexiones residuales se aplican desde la capa 1 en adelante (cuando
+in_dim = out_dim = hidden * heads). En la capa 0, el cambio de dimensión
+(hidden → hidden*heads) impide la conexión directa. La implementación previene
+explícitamente el KeyError en escenarios sin clientes activos.
 
-Salidas ($\mathcal{A}$)
---------------------------------------
-channel_logits : Probabilidades de la Política Actor $\pi_\theta$ (n_APs, n_canales).
-power_logits   : Probabilidades de la Política Actor $\pi_\theta$ (n_APs, n_potencias).
+Asimetría E_ac / E_ca
+----------------------
+E_ac es densa (todos los APs visibles por cada cliente) y transporta atributos
+de arista RSSI para que el mensaje del AP informe al cliente sobre la calidad
+del enlace potencial. E_ca es escasa (solo el AP asignado) y no tiene atributos
+de arista, reflejando que la asociación es una variable discreta del estado.
+Esta asimetría está justificada teóricamente: el agente necesita saber qué APs
+puede ver cada cliente, pero solo el AP actual puede agregar información de
+tráfico para la cabeza de política.
 """
 
 import torch
@@ -36,71 +43,147 @@ from torch_geometric.nn import HeteroConv, GATv2Conv, Linear
 
 
 class GNN(torch.nn.Module):
+    """
+    Política GNN heterogénea para asignación de recursos WiFi.
+
+    Parameters
+    ----------
+    hidden_channels : int
+        Dimensión interna de los embeddings de nodo (d).
+    num_aps : int
+        Número de APs del edificio (N). Retenido para compatibilidad de interfaz.
+    out_channels_ch : int
+        Cardinalidad del espacio de canales |C| = 3.
+    out_channels_pwr : int
+        Cardinalidad del espacio de potencias |P| = 3.
+    num_layers : int
+        Número de capas de propagación de mensajes L. Por defecto 3.
+    heads : int
+        Número de cabezas de atención multi-head (h). Por defecto 2.
+        El embedding de salida por capa tiene dimensión d · h.
+    """
 
     def __init__(
         self,
-        hidden_channels: int,
-        num_aps:         int,
-        out_channels_ch:  int = 3,   # número de canales disponibles
-        out_channels_pwr: int = 3,   # número de potencias disponibles
+        hidden_channels:  int,
+        num_aps:          int,
+        out_channels_ch:  int = 3,
+        out_channels_pwr: int = 1,
+        num_layers:       int = 3,
+        heads:            int = 2,
     ):
         super().__init__()
-        self.num_aps = num_aps
+        self.num_aps    = num_aps
+        self.num_layers = num_layers
+        self.heads      = heads
 
-        # Encoders de features crudas
+        # Encoders de features crudas hacia el espacio latente d
         self.ap_encoder     = Linear(-1, hidden_channels)
         self.client_encoder = Linear(-1, hidden_channels)
 
-        # Capa 1: AP→Cliente (con edge_attr) + Cliente→AP
-        self.conv1 = HeteroConv({
-            ('ap',     'connects',    'client'): GATv2Conv((-1, -1), hidden_channels, heads=2, add_self_loops=False, edge_dim=1),
-            ('client', 'connected_to', 'ap')  : GATv2Conv((-1, -1), hidden_channels, heads=2, add_self_loops=False),
-        }, aggr='sum')
+        # Capas convolucionales heterogéneas
+        self.convs = nn.ModuleList()
+        for i in range(num_layers):
+            # Capa 0: in_channels = hidden (salida del encoder)
+            # Capas 1..L: in_channels = hidden * heads (salida de la capa anterior)
+            in_channels = hidden_channels if i == 0 else hidden_channels * heads
 
-        # Capa 2: razonamiento más profundo
-        self.conv2 = HeteroConv({
-            ('ap',     'connects',    'client'): GATv2Conv((-1, -1), hidden_channels, heads=2, add_self_loops=False, edge_dim=1),
-            ('client', 'connected_to', 'ap')  : GATv2Conv((-1, -1), hidden_channels, heads=2, add_self_loops=False),
-        }, aggr='sum')
+            self.convs.append(HeteroConv(
+                {
+                    ('ap', 'connects', 'client'): GATv2Conv(
+                        in_channels, hidden_channels,
+                        heads=heads, add_self_loops=False, edge_dim=1,
+                    ),
+                    ('client', 'connected_to', 'ap'): GATv2Conv(
+                        in_channels, hidden_channels,
+                        heads=heads, add_self_loops=False,
+                    ),
+                    ('ap', 'interferes', 'ap'): GATv2Conv(
+                        in_channels, hidden_channels,
+                        heads=heads, add_self_loops=False, edge_dim=1,
+                    ),
+                },
+                aggr='sum',
+            ))
 
-        # Cabezas de política (sólo sobre nodos AP)
-        h2 = hidden_channels * 2  # × 2 por los 2 heads de GATv2
+        # Cabezas de política: leen solo embeddings AP de dimensión hidden * heads
+        final_dim = hidden_channels * heads
 
         self.channel_head = nn.Sequential(
-            Linear(h2, hidden_channels),
+            Linear(final_dim, hidden_channels),
             nn.ReLU(),
             Linear(hidden_channels, out_channels_ch),
         )
 
         self.power_head = nn.Sequential(
-            Linear(h2, hidden_channels),
+            Linear(final_dim, hidden_channels),
             nn.ReLU(),
             Linear(hidden_channels, out_channels_pwr),
         )
 
-    def forward(self, x_dict, edge_index_dict, edge_attr_dict=None, batch_dict=None):
-        # 1. Encode
-        x = {}
+    def forward(
+        self,
+        x_dict:         dict,
+        edge_index_dict: dict,
+        edge_attr_dict:  dict | None = None,
+        batch_dict:      dict | None = None,
+    ) -> tuple[torch.Tensor, torch.Tensor]:
+        """
+        Propagación hacia adelante.
+
+        Parameters
+        ----------
+        x_dict : dict
+            Features de nodo por tipo: {'ap': (N, F_ap), 'client': (U, F_c)}.
+        edge_index_dict : dict
+            Índices de arista por relación.
+        edge_attr_dict : dict | None
+            Atributos de arista por relación (obligatorio para E_ac y E_aa).
+
+        Returns
+        -------
+        tuple[torch.Tensor, torch.Tensor]
+            (channel_logits, power_logits), ambos de shape (N, |·|).
+        """
+        # 1. Codificación inicial al espacio latente d
+        x: dict[str, torch.Tensor] = {}
         x['ap'] = self.ap_encoder(x_dict['ap'])
+
         if 'client' in x_dict and x_dict['client'].shape[0] > 0:
             x['client'] = self.client_encoder(x_dict['client'])
         else:
-            # Grafo vacío (sin clientes activos): AP opera sin información de carga.
-            # Inicializar con ceros para que el message passing no propague NaN.
-            n_ap = x_dict['ap'].shape[0]
+            # Sin clientes activos: tensor vacío con la dimensión correcta
             x['client'] = x_dict['ap'].new_zeros((0, x['ap'].shape[-1]))
 
-        # 2. Convoluciones (edge_attr_dict puede ser None o dict)
-        # nan_to_num garantiza que GATv2Conv con grafos vacíos no propague NaN a los APs.
+        # 2. Propagación de mensajes multi-capa con conexiones residuales
         ea = edge_attr_dict or {}
-        x = self.conv1(x, edge_index_dict, ea)
-        x = {k: F.elu(v.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)) for k, v in x.items()}
 
-        x = self.conv2(x, edge_index_dict, ea)
-        x = {k: F.elu(v.nan_to_num(nan=0.0, posinf=0.0, neginf=0.0)) for k, v in x.items()}
+        for i, conv in enumerate(self.convs):
+            x_new = conv(x, edge_index_dict, ea)
 
-        # 3. Cabezas de política — nan_to_num final como guardia de seguridad
-        ap_emb = x['ap']
+            # ELU + limpieza de NaNs numéricos (pueden surgir de grafos vacíos)
+            x_new = {k: F.elu(v.nan_to_num(0.0)) for k, v in x_new.items()}
+
+            if i > 0:
+                # Conexión residual: solo cuando in_dim == out_dim == hidden*heads.
+                # Se itera sobre las claves presentes en ambos dicts para evitar
+                # KeyError en timesteps sin clientes activos (x puede tener
+                # 'client' con 0 filas, pero x_new podría omitirlo si HeteroConv
+                # no produce salida para ese tipo de nodo).
+                x = {
+                    k: x_new[k] + x[k]
+                    for k in x_new
+                    if k in x and x_new[k].shape == x[k].shape
+                }
+                # Preservar claves que HeteroConv omitió (p.ej. 'client' vacío)
+                for k in x_new:
+                    if k not in x:
+                        x[k] = x_new[k]
+            else:
+                x = x_new
+
+        # 3. Cabezas de política sobre embeddings AP
+        ap_emb         = x['ap']
         channel_logits = self.channel_head(ap_emb).nan_to_num(nan=0.0)
         power_logits   = self.power_head(ap_emb).nan_to_num(nan=0.0)
 

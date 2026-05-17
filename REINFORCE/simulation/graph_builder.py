@@ -49,6 +49,7 @@ def construir_grafo_timestep(
     t: int,
     asignaciones: torch.Tensor,
     grilla_RSSI: torch.Tensor,
+    grilla_ganancias: torch.Tensor,
     decisiones_APs: torch.Tensor,
     avg_rates: torch.Tensor,
     eventos,
@@ -91,15 +92,22 @@ def construir_grafo_timestep(
     # ── Nodos AP: X_t = {c_{n,t}, P_{n,t}} ────────────────────────────────
     canal_idx    = decisiones_APs[:, 0]
     potencia_idx = decisiones_APs[:, 1]
-    canal_raw    = available_channels[canal_idx].float()
-    potencia_raw = tx_powers_dbm[potencia_idx].float()
+    
+    # Normalización de features del AP: fundamental para la convergencia
+    canal_norm    = (available_channels[canal_idx].float() - 1.0) / 10.0
+    potencia_norm = (tx_powers_dbm[potencia_idx].float() - 8.0) / 12.0
 
     ap_asignado_t = asignaciones[:, t, 0]   # (n_cli,) — fila de A_t
     mask_activos  = ~torch.isnan(ap_asignado_t)
 
-    data['ap'].x = torch.stack(
-        [canal_raw, potencia_raw], dim=1
-    )  # (N, 2)
+    # δ_t normalizado: tiempo restante para el próximo arribo (Sección LaTeX §Dinámica)
+    # Se inyecta en todos los APs como contexto global para romper la observabilidad parcial.
+    delta_t_norm = torch.full((n_APs, 1), float(delta_t) / max(max_timesteps, 1), 
+                              dtype=torch.float32, device=dev)
+
+    data['ap'].x = torch.cat(
+        [torch.stack([canal_norm, potencia_norm], dim=1), delta_t_norm], dim=1
+    )  # (N, 3)
 
     # ── Nodos Cliente: señales ε_{t,u}, r_{u,τ} y RSSI propio ─────────────────
     activos_idx = torch.where(mask_activos)[0]
@@ -143,11 +151,18 @@ def construir_grafo_timestep(
         2, band_safe.view(-1, 1, 1).expand(-1, n_APs, 1)
     ).squeeze(2)   # (U_t, N)
 
+    # Usamos la ganancia de canal pura (H) como atributo de arista para generalizar 
+    # independientemente de la potencia elegida en el timestep anterior.
+    gan_banda = grilla_ganancias[activos_idx, t, :, :].gather(
+        2, band_safe.view(-1, 1, 1).expand(-1, n_APs, 1)
+    ).squeeze(2)   # (U_t, N)
+
     vis_cli_local, vis_ap = torch.where(rssi_banda > UMBRAL_VIS)
 
     if len(vis_ap) > 0:
         edge_index_down = torch.stack([vis_ap, vis_cli_local], dim=0)
-        edge_attr_down  = ((rssi_banda[vis_cli_local, vis_ap] + 100.0) / 70.0).unsqueeze(1)
+        # Normalizar ganancia: rango típico [-130, -50] dB → shift +130 / 80
+        edge_attr_down  = ((gan_banda[vis_cli_local, vis_ap] + 130.0) / 80.0).unsqueeze(1).clamp(0.0, 1.0)
     else:
         edge_index_down = torch.empty((2, 0), dtype=torch.long, device=dev)
         edge_attr_down  = torch.empty((0, 1), dtype=torch.float32, device=dev)
@@ -158,5 +173,26 @@ def construir_grafo_timestep(
     # ── Aristas Cliente → AP: asignación activa A_t (G_A binario) ────────────
     local_idx = torch.arange(n_activos, device=dev)
     data['client', 'connected_to', 'ap'].edge_index = torch.stack([local_idx, ap_activos], dim=0)
+
+    # ── Aristas AP ↔ AP: Interferencia por co-observación ────────────────────
+    # Dos APs se interfieren si pueden "ver" al mismo cliente activo (solapamiento).
+    # B es la matriz binaria de visibilidad (APs x Clientes)
+    B = torch.zeros((n_APs, n_activos), device=dev)
+    if len(vis_ap) > 0:
+        B[vis_ap, vis_cli_local] = 1.0
+    
+    # A = B * B^T es la matriz de co-observación (APs x APs)
+    # A_ij indica cuántos clientes en común ven el AP i y el AP j.
+    A = B @ B.T
+    A.fill_diagonal_(0)  # Evitamos auto-bucles en el grafo de interferencia
+    
+    ap_src, ap_dst = torch.where(A > 0)
+    if len(ap_src) > 0:
+        data['ap', 'interferes', 'ap'].edge_index = torch.stack([ap_src, ap_dst], dim=0)
+        # Normalizamos el peso por el número de clientes activos
+        data['ap', 'interferes', 'ap'].edge_attr = (A[ap_src, ap_dst] / n_activos).unsqueeze(1)
+    else:
+        data['ap', 'interferes', 'ap'].edge_index = torch.empty((2, 0), dtype=torch.long, device=dev)
+        data['ap', 'interferes', 'ap'].edge_attr = torch.empty((0, 1), dtype=torch.float32, device=dev)
 
     return data
