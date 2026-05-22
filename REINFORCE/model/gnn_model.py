@@ -100,7 +100,7 @@ class GNN(torch.nn.Module):
                     ),
                     ('ap', 'interferes', 'ap'): GATv2Conv(
                         in_channels, hidden_channels,
-                        heads=heads, add_self_loops=False, edge_dim=1,
+                        heads=heads, add_self_loops=False, edge_dim=2,
                     ),
                 },
                 aggr='sum',
@@ -180,7 +180,16 @@ class GNN(torch.nn.Module):
                     if k not in x:
                         x[k] = x_new[k]
             else:
-                x = x_new
+                # Capa 0: in_dim = hidden, out_dim = hidden * heads.
+                # Proyección residual mediante repetición a lo largo de la dimensión latente.
+                x = {
+                    k: x_new[k] + x[k].repeat(1, self.heads)
+                    for k in x_new
+                    if k in x and x_new[k].shape == x[k].repeat(1, self.heads).shape
+                }
+                for k in x_new:
+                    if k not in x:
+                        x[k] = x_new[k]
 
         # 3. Cabezas de política sobre embeddings AP
         ap_emb         = x['ap']

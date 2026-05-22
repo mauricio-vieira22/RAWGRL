@@ -149,7 +149,8 @@ class GNN2(torch.nn.Module):
                 
                 if edge_attr_dict and ('ap', 'interferes', 'ap') in edge_attr_dict:
                     attr = edge_attr_dict[('ap', 'interferes', 'ap')]
-                    if attr.dim() > 1: attr = attr.squeeze(-1)
+                    if attr.dim() > 1:
+                        attr = attr[:, 0]
                     attrs.append(attr)
                 else:
                     attrs.append(torch.ones(num_edges, device=device))

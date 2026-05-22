@@ -52,6 +52,7 @@ import time
 from pathlib import Path
 
 import pandas as pd
+import numpy as np
 import torch
 import torch.optim as optim
 from torch.distributions import Categorical
@@ -174,13 +175,13 @@ def evaluate_policy(
 
     Returns
     -------
-    tuple[float, float]
-        (G_val, val_rate): retorno descontado G_0 del episodio de validación
-        y throughput total acumulado (suma de total_rate por step).
+    tuple[float, float, float]
+        (G_val, val_rate, val_rate_per_client): retorno descontado G_0,
+        throughput total acumulado y throughput medio por cliente activo.
     """
     obs, _ = env.reset()
     done   = False
-    rewards, ep_rates = [], []
+    rewards, ep_rates, n_active_list = [], [], []
     model.eval()
     with torch.no_grad():
         while not done:
@@ -195,10 +196,13 @@ def evaluate_policy(
             done = terminated or truncated
             rewards.append(reward / reward_scale)
             ep_rates.append(info.get("total_rate", 0.0))
+            n_active = max(int(info.get("n_active_clients", 1)), 1)
+            n_active_list.append(n_active)
     model.train()
     G_val    = compute_returns(rewards, gamma)[0].item() if rewards else 0.0
     val_rate = sum(ep_rates)
-    return G_val, val_rate
+    val_rate_per_client = sum(ep_rates) / sum(n_active_list) if sum(n_active_list) > 0 else 0.0
+    return G_val, val_rate, val_rate_per_client
 
 
 import matplotlib
@@ -206,10 +210,10 @@ import matplotlib.pyplot as plt
 import math
 
 class RealTimePlotter:
-    """Graficador interactivo en tiempo real para loss y reward usando GUI local."""
+    """Graficador interactivo en tiempo real para loss, reward y rate/cliente usando GUI local."""
     def __init__(self, title="RAWGRL: Real-Time Training Monitor"):
         plt.ion()  # Habilitar modo interactivo de matplotlib
-        self.fig, self.axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        self.fig, self.axes = plt.subplots(1, 3, figsize=(15, 4.5))
         self.fig.suptitle(title, fontsize=12, fontweight='bold', color='#1e293b')
         
         # 1. Panel de Recompensa (Return G_t)
@@ -230,16 +234,25 @@ class RealTimePlotter:
         self.ax_loss.set_ylabel("Loss", fontsize=9)
         self.ax_loss.grid(True, linestyle=':', alpha=0.6)
         self.ax_loss.legend(loc='upper right', fontsize=8)
+
+        # 3. Panel de Rate por Cliente
+        self.ax_rate = self.axes[2]
+        self.line_rate, = self.ax_rate.plot([], [], color='#10b981', linewidth=1.5, label='Train Rate/Client')
+        self.line_val_rate, = self.ax_rate.plot([], [], color='#ec4899', linestyle='--', linewidth=1.5, label='Val Rate/Client')
+        self.ax_rate.set_title("Throughput per Client", fontsize=10, fontweight='bold')
+        self.ax_rate.set_xlabel("Episode", fontsize=9)
+        self.ax_rate.set_ylabel("Bits/s/Hz", fontsize=9)
+        self.ax_rate.grid(True, linestyle=':', alpha=0.6)
+        self.ax_rate.legend(loc='upper left', fontsize=8)
         
         self.fig.tight_layout()
         plt.show()
         
-    def update(self, episodes, returns, val_returns, losses):
+    def update(self, episodes, returns, val_returns, losses, rates, val_rates):
         # 1. Actualizar Recompensas
         self.line_reward.set_xdata(episodes)
         self.line_reward.set_ydata(returns)
         
-        # Filtrar valores NaN de la validación periódica
         val_eps = [ep for ep, val in zip(episodes, val_returns) if not math.isnan(val)]
         val_y = [val for val in val_returns if not math.isnan(val)]
         self.line_val.set_xdata(val_eps)
@@ -248,6 +261,15 @@ class RealTimePlotter:
         # 2. Actualizar Loss
         self.line_loss.set_xdata(episodes)
         self.line_loss.set_ydata(losses)
+
+        # 3. Actualizar Rate/Cliente
+        self.line_rate.set_xdata(episodes)
+        self.line_rate.set_ydata(rates)
+
+        val_rate_eps = [ep for ep, val in zip(episodes, val_rates) if not math.isnan(val)]
+        val_rate_y = [val for val in val_rates if not math.isnan(val)]
+        self.line_val_rate.set_xdata(val_rate_eps)
+        self.line_val_rate.set_ydata(val_rate_y)
         
         # Re-escalar vistas de manera automática y dinámica
         self.ax_reward.relim()
@@ -255,6 +277,9 @@ class RealTimePlotter:
         
         self.ax_loss.relim()
         self.ax_loss.autoscale_view()
+
+        self.ax_rate.relim()
+        self.ax_rate.autoscale_view()
         
         # Redibujar canvas y procesar eventos GUI del sistema operativo (macOS Aqua)
         self.fig.canvas.draw()
@@ -301,7 +326,7 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         Modelo entrenado e historial de métricas.
     """
     device = torch.device("cpu")
-    log.info("Dispositivo de cómputo activo: %s", device)
+    # log.info("Dispositivo de cómputo activo: %s", device)
 
     # 1. Carga de distribuciones de canal del edificio
     log.info("Cargando distribuciones para edificio: %s", args.building_id)
@@ -309,7 +334,7 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
 
     available_channels = [1, 6, 11]
     # tx_powers_dbm      = [20.0, 14.0, 8.0]
-    tx_powers_dbm      = [23.0]
+    tx_powers_dbm      = [23.0, 14.0, 8.0]
     n_aps              = len(distributions[0].blocks[0].datos)
 
     # 2. Entornos de entrenamiento y evaluación con semillas distintas
@@ -389,17 +414,13 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         log.warning("No se pudo iniciar la interfaz gráfica en tiempo real: %s. Continuando entrenamiento sin ventana GUI.", e)
         plotter = None
 
-    log.info(
-        "Iniciando optimización: E=%d episodios | T=%d pasos | sticky=%s",
-        args.episodes, args.timesteps, args.sticky_mode,
-    )
-    log.info("=" * 99)
-    log.info(
-        f"{'Ep':<6} | {'Val Rate':>10} | {'G_val':>10} | "
-        f"{'Train Rate':>10} | {'Loss':>9} | {'Entropy':>9} | "
-        f"{'GradNorm':>8} | {'Time':>6}"
-    )
-    log.info("-" * 99)
+    print(f"\n{'='*80}")
+    print(f"  Marco de Optimización Analítica: REINFORCE Policy Gradient")
+    print(f"  Topología Física: Edificio {args.building_id} | Horizonte Temporal E: {args.episodes} episodios")
+    print(f"{'='*80}\n")
+    print(f"[Hardware] Dispositivo de Cómputo Tensorial: {device}\n")
+    print(f"{'Epoch':<6} | {'G_t (Train)':>11} | {'G_t (Val)':>10} | {'L(theta)':>9} | {'L(phi)':>9} | {'Entropy':>9} | {'Time(s)':>7}")
+    print(f"{'-'*7:<7}+{'-'*13:<13}+{'-'*12:<12}+{'-'*11:<11}+{'-'*11:<11}+{'-'*10:<10}+{'-'*8:<8}")
 
     # 5. Bucle principal REINFORCE
     for episode in range(args.episodes):
@@ -496,26 +517,30 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         scheduler.step()
 
         # Validación determinista cada 10 episodios
-        G_val, val_rate = float("nan"), float("nan")
-        if (episode + 1) % 10 == 0 or episode == 0:
-            G_val, val_rate = evaluate_policy(
+        G_val, val_rate, val_rate_per_client = float("nan"), float("nan"), float("nan")
+        if (episode + 1) % args.eval_every == 0 or episode == 0:
+            G_val, val_rate, val_rate_per_client = evaluate_policy(
                 env_eval, model, device, args.gamma, args.reward_scale
             )
             if G_val > best_return:
                 best_return = G_val
                 torch.save(model.state_dict(), save_dir / "best_model.pt")
 
+        rate_per_client = sum(ep_rates) / sum(n_clients_list) if sum(n_clients_list) > 0 else 0.0
+
         metrics_log.append({
-            "episode":    episode + 1,
-            "return":     G_0,
-            "G_val":      G_val,
-            "baseline":   baseline_ema[0].item() if baseline_ema is not None else 0.0,
-            "total_rate": sum(ep_rates),
-            "val_rate":   val_rate,
-            "loss":       policy_loss.item(),
-            "entropy":    entropies_t.mean().item(),
-            "grad_norm":  grad_norm.item(),
-            "sec":        time.time() - t_ep,
+            "episode":             episode + 1,
+            "return":              G_0,
+            "G_val":               G_val,
+            "baseline":            baseline_ema[0].item() if baseline_ema is not None else 0.0,
+            "total_rate":          sum(ep_rates),
+            "val_rate":            val_rate,
+            "rate_per_client":     rate_per_client,
+            "val_rate_per_client": val_rate_per_client,
+            "loss":                policy_loss.item(),
+            "entropy":             entropies_t.mean().item(),
+            "grad_norm":           grad_norm.item(),
+            "sec":                 time.time() - t_ep,
         })
 
         # Actualizar la interfaz gráfica interactiva en tiempo real (cada episodio)
@@ -525,20 +550,22 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
                 returns = [m["return"] for m in metrics_log]
                 val_returns = [m["G_val"] for m in metrics_log]
                 losses = [m["loss"] for m in metrics_log]
-                plotter.update(eps, returns, val_returns, losses)
+                rates = [m["rate_per_client"] for m in metrics_log]
+                val_rates = [m["val_rate_per_client"] for m in metrics_log]
+                plotter.update(eps, returns, val_returns, losses, rates, val_rates)
             except Exception:
                 pass
 
         if (episode + 1) % 10 == 0 or episode == 0:
-            log.info(
+            g_val_str = f"{G_val:>10.2f}" if not np.isnan(G_val) else f"{'—':>10}"
+            print(
                 f"{episode+1:<6} | "
-                f"{val_rate:>10.1f} | "
-                f"{G_val:>10.2f} | "
-                f"{sum(ep_rates):>10.1f} | "
+                f"{G_0:>11.2f} | "
+                f"{g_val_str} | "
                 f"{policy_loss.item():>9.4f} | "
+                f"{'—':>9} | "
                 f"{entropies_t.mean().item():>9.4f} | "
-                f"{grad_norm.item():>8.3f} | "
-                f"{time.time() - t_ep:>6.1f}"
+                f"{time.time() - t_ep:>7.1f}"
             )
             # Guardar CSV temporal y actualizar gráficas en tiempo real
             try:
@@ -590,31 +617,50 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
 # ── CLI ───────────────────────────────────────────────────────────────────────
 
 def parse_args() -> argparse.Namespace:
-    """Configura la interfaz de línea de comandos."""
+    """Configura la interfaz de línea de comandos unificada."""
     p = argparse.ArgumentParser(description="NetROML: REINFORCE WiFi Resource Allocation")
-    p.add_argument("--building_id",     default="990")
-    p.add_argument("--save_dir",        default="outputs/models")
-    p.add_argument("--seed",            type=int,   default=42)
-    p.add_argument("--episodes",        type=int,   default=50)
-    p.add_argument("--timesteps",       type=int,   default=1000)
-    p.add_argument("--arrival_rate",    type=float, default=0.5)
-    p.add_argument("--mean_dur",        type=float, default=50.0)
-    p.add_argument("--decision_period", type=int,   default=1)
-    p.add_argument("--no_5g",           action="store_true",
-                   help="Deshabilita la banda de 5 GHz")
-    p.add_argument("--sticky_mode",     type=str,   default="full",
-                   choices=["full", "sticky", "lite"])
-    p.add_argument("--hidden",          type=int,   default=64)
-    p.add_argument("--model_type",      type=str,   default="gnn1",
-                   choices=["gnn1", "gnn2", "random"])
-    p.add_argument("--num_layers",      type=int,   default=4,
-                   help="Número de capas convolucionales (GNN1)")
-    p.add_argument("--tagconv_k",       type=int,   default=5,
-                   help="Número de hops K para TAGConv (GNN2)")
-    p.add_argument("--lr",              type=float, default=3e-4)
-    p.add_argument("--reward_scale",    type=float, default=1.0)
-    p.add_argument("--gamma",           type=float, default=0.99)
-    p.add_argument("--entropy_coef",    type=float, default=0.01)
+    
+    # 1. Configuración de Entorno y Datos
+    p.add_argument("--building_id",     default="814", type=str, help="ID del edificio objetivo.")
+    p.add_argument("--dist_joblib",     default="data/distributions_814.joblib", type=str, help="Path a distributions.joblib.")
+    p.add_argument("--step2_csv",       default="data/dataset_814_step2.csv", type=str, help="Path al dataset step2 CSV.")
+    p.add_argument("--save_dir",        default="outputs/models", type=str, help="Directorio de guardado.")
+    p.add_argument("--seed",            type=lambda x: None if str(x).lower() == 'none' else int(x), default=2026, help="Semilla aleatoria.")
+    p.add_argument("--eval_every",      type=int,   default=20, help="Frecuencia de evaluación (A2C/PPO/REINFORCE).")
+
+    # 2. Parámetros del Episodio y Simulación
+    p.add_argument("--episodes",        type=int,   default=500, help="Número de episodios de entrenamiento.")
+    p.add_argument("--timesteps",       type=int,   default=1000, help="Horizonte temporal del episodio (slots).")
+    p.add_argument("--decision_period", type=int,   default=10, help="Periodo de decisión de recursos (slots).")
+    p.add_argument("--arrival_rate",    type=float, default=2.0, help="Tasa de arribo de clientes.")
+    p.add_argument("--mean_dur",        type=float, default=15.0, help="Duración promedio de sesión (slots).")
+    p.add_argument("--no_5g",           action="store_true", help="Deshabilita el uso de la banda de 5 GHz.")
+    p.add_argument("--sticky_mode",     type=str,   default="full", choices=["full", "sticky", "lite"], help="Modo de asociación de cliente.")
+
+    # 3. Parámetros de la Red GNN
+    p.add_argument("--hidden",          type=int,   default=64, help="Dimensión latente de los embeddings.")
+    p.add_argument("--model_type",      type=str,   default="gnn1", choices=["gnn1", "gnn2", "random"], help="Tipo de GNN.")
+    p.add_argument("--num_layers",      type=int,   default=4, help="Número de capas convolucionales.")
+    p.add_argument("--tagconv_k",       type=int,   default=5, help="Hops K para TAGConv en GNN2.")
+
+    # 4. Hiperparámetros de RL Comunes
+    p.add_argument("--reward_scale",    type=float, default=1000.0, help="Escalador de la recompensa física.")
+    p.add_argument("--lr",              type=float, default=3e-4, help="Learning rate del Actor / GNN.")
+    p.add_argument("--gamma",           type=float, default=0.99, help="Factor de descuento gamma.")
+    p.add_argument("--entropy_coef",    type=float, default=0.03, help="Coeficiente para bono de entropía.")
+
+    # 5. Parámetros de Critic y GAE (A2C y PPO)
+    p.add_argument("--lr_critic",     type=float, default=1e-3, help="Learning rate de la cabeza Critic.")
+    p.add_argument("--gae_lambda",    type=float, default=0.95, help="Lambda para GAE.")
+    p.add_argument("--vf_coef",       type=float, default=0.5, help="Peso del término Critic en la loss total.")
+
+    # 6. Parámetros Específicos de PPO
+    p.add_argument("--update_epochs", type=int,   default=4, help="PPO: Épocas de optimización sobre el rollout.")
+    p.add_argument("--minibatch_size",type=int,   default=64, help="PPO: Tamaño de minibatch.")
+    p.add_argument("--clip_coef",     type=float, default=0.2, help="PPO: Coeficiente de clipping de la política.")
+    p.add_argument("--max_grad_norm", type=float, default=0.5, help="PPO/Común: Clipping global de gradiente.")
+    p.add_argument("--norm_adv",       action=argparse.BooleanOptionalAction, default=True, help="PPO: Normalizar ventajas.")
+
     return p.parse_args()
 
 

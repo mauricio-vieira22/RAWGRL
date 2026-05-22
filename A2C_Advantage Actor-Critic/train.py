@@ -119,6 +119,7 @@ def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training
     values:    list[torch.Tensor] = []
     rewards:   list[float]        = []
     ep_rates:  list[float]        = []
+    n_clients: list[int]          = []
 
     done = False
     while not done:
@@ -156,6 +157,8 @@ def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training
 
         rewards.append(reward / reward_scale)
         ep_rates.append(info.get("total_rate", 0.0))
+        n_active = max(int(info.get("n_active_clients", 1)), 1)
+        n_clients.append(n_active)
 
     return {
         "rewards":   rewards,
@@ -163,6 +166,7 @@ def run_episode(env: NetworkGraphEnv, model: GNN, device: torch.device, training
         "entropies": entropies,
         "values":    values,
         "ep_rates":  ep_rates,
+        "n_clients": n_clients,
     }
 
 
@@ -171,10 +175,10 @@ import matplotlib.pyplot as plt
 import math
 
 class RealTimePlotter:
-    """Graficador interactivo en tiempo real para loss y reward usando GUI local."""
+    """Graficador interactivo en tiempo real para loss, reward y rate/cliente usando GUI local."""
     def __init__(self, title="RAWGRL (A2C): Real-Time Training Monitor"):
         plt.ion()  # Habilitar modo interactivo de matplotlib
-        self.fig, self.axes = plt.subplots(1, 2, figsize=(11, 4.5))
+        self.fig, self.axes = plt.subplots(1, 3, figsize=(15, 4.5))
         self.fig.suptitle(title, fontsize=12, fontweight='bold', color='#1e293b')
         
         # 1. Panel de Recompensa (Return G_t)
@@ -195,16 +199,25 @@ class RealTimePlotter:
         self.ax_loss.set_ylabel("Loss", fontsize=9)
         self.ax_loss.grid(True, linestyle=':', alpha=0.6)
         self.ax_loss.legend(loc='upper right', fontsize=8)
+
+        # 3. Panel de Rate por Cliente
+        self.ax_rate = self.axes[2]
+        self.line_rate, = self.ax_rate.plot([], [], color='#10b981', linewidth=1.5, label='Train Rate/Client')
+        self.line_val_rate, = self.ax_rate.plot([], [], color='#ec4899', linestyle='--', linewidth=1.5, label='Val Rate/Client')
+        self.ax_rate.set_title("Throughput per Client", fontsize=10, fontweight='bold')
+        self.ax_rate.set_xlabel("Episode", fontsize=9)
+        self.ax_rate.set_ylabel("Bits/s/Hz", fontsize=9)
+        self.ax_rate.grid(True, linestyle=':', alpha=0.6)
+        self.ax_rate.legend(loc='upper left', fontsize=8)
         
         self.fig.tight_layout()
         plt.show()
         
-    def update(self, episodes, returns, val_returns, losses):
+    def update(self, episodes, returns, val_returns, losses, rates, val_rates):
         # 1. Actualizar Recompensas
         self.line_reward.set_xdata(episodes)
         self.line_reward.set_ydata(returns)
         
-        # Filtrar valores NaN de la validación periódica
         val_eps = [ep for ep, val in zip(episodes, val_returns) if not math.isnan(val)]
         val_y = [val for val in val_returns if not math.isnan(val)]
         self.line_val.set_xdata(val_eps)
@@ -213,6 +226,15 @@ class RealTimePlotter:
         # 2. Actualizar Loss
         self.line_loss.set_xdata(episodes)
         self.line_loss.set_ydata(losses)
+
+        # 3. Actualizar Rate/Cliente
+        self.line_rate.set_xdata(episodes)
+        self.line_rate.set_ydata(rates)
+
+        val_rate_eps = [ep for ep, val in zip(episodes, val_rates) if not math.isnan(val)]
+        val_rate_y = [val for val in val_rates if not math.isnan(val)]
+        self.line_val_rate.set_xdata(val_rate_eps)
+        self.line_val_rate.set_ydata(val_rate_y)
         
         # Re-escalar vistas de manera automática y dinámica
         self.ax_reward.relim()
@@ -220,6 +242,9 @@ class RealTimePlotter:
         
         self.ax_loss.relim()
         self.ax_loss.autoscale_view()
+
+        self.ax_rate.relim()
+        self.ax_rate.autoscale_view()
         
         # Redibujar canvas y procesar eventos GUI del sistema operativo (macOS Aqua)
         self.fig.canvas.draw()
@@ -249,7 +274,7 @@ def train(args: argparse.Namespace):
     print(f"[Memoria]  {len(distributions)} instanciaciones cliente-canal cargadas.\n")
 
     available_channels = [1, 6, 11]
-    tx_powers_dbm      = [20.0, 14.0, 8.0]
+    tx_powers_dbm      = [23.0, 14.0, 8.0]
     n_aps              = len(distributions[0].blocks[0].datos)
 
     # ── Construcción del Entorno de Simulación Electromagnética ─────────────
@@ -329,8 +354,7 @@ def train(args: argparse.Namespace):
         actor_params = (
             list(model.ap_encoder.parameters())
             + list(model.client_encoder.parameters())
-            + list(model.conv1.parameters())
-            + list(model.conv2.parameters())
+            + list(model.convs.parameters())
             + list(model.channel_head.parameters())
             + list(model.power_head.parameters())
         )
@@ -366,12 +390,17 @@ def train(args: argparse.Namespace):
         print(f"[Aviso] No se pudo iniciar la interfaz gráfica en tiempo real: {e}. Continuando sin ventana GUI.")
         plotter = None
 
-    print(f"{'='*70}")
-    print(f"{'Epoch (e)':<6} | {'G_t (Train)':>11} | {'G_t (Val)':>10} | {'L(theta)':>9} | {'L(phi)':>9} | {'H(pi)':>9}")
-    print(f"-------+-------------+------------+-----------+-----------+-----------")
+    print(f"\n{'='*80}")
+    print(f"  Marco de Optimización Analítica: Advantage Actor-Critic (A2C)")
+    print(f"  Topología Física: Edificio {args.building_id} | Horizonte Temporal E: {args.episodes} episodios")
+    print(f"{'='*80}\n")
+    print(f"[Hardware] Dispositivo de Cómputo Tensorial: cpu\n")
+    print(f"{'Epoch':<6} | {'G_t (Train)':>11} | {'G_t (Val)':>10} | {'L(theta)':>9} | {'L(phi)':>9} | {'Entropy':>9} | {'Time(s)':>7}")
+    print(f"{'-'*7:<7}+{'-'*13:<13}+{'-'*12:<12}+{'-'*11:<11}+{'-'*11:<11}+{'-'*10:<10}+{'-'*8:<8}")
 
     # ── Bucle Central de Optimización Algorítmica (A2C) ───────────────────────
     for episode in range(args.episodes):
+        t_ep = time.time()
         current_seed = args.seed + episode if args.seed is not None else None
         env._adm.random_seed = current_seed
 
@@ -437,7 +466,8 @@ def train(args: argparse.Namespace):
             values_norm = (values_t - returns_t.mean().detach()) / (returns_t.std().detach() + 1e-8)
         else:
             values_norm = values_t
-        loss_critic  = F.mse_loss(values_norm, returns_norm)
+        # loss_critic  = F.mse_loss(values_norm, returns_norm)
+        loss_critic  = F.huber_loss(values_norm, returns_norm, delta=1.0)
         
         # Bono de Entropía: Fomenta la exploración penalizando la certidumbre absoluta.
         loss_entropy = -entropies_t.mean()
@@ -464,10 +494,12 @@ def train(args: argparse.Namespace):
 
         # ── Validación Periódica ──────────────────────────────────────────────
         G_val = float("nan")
+        val_rate_per_client = float("nan")
         if (episode + 1) % args.eval_every == 0 or episode == 0:
             model.eval()
             val_traj = run_episode(env_eval, model, device, training=False, reward_scale=args.reward_scale)
             G_val = compute_returns(val_traj["rewards"], gamma=args.gamma)[0].item()
+            val_rate_per_client = sum(val_traj["ep_rates"]) / sum(val_traj["n_clients"]) if sum(val_traj["n_clients"]) > 0 else 0.0
 
             if G_val > best_G_val:
                 best_G_val = G_val
@@ -477,20 +509,24 @@ def train(args: argparse.Namespace):
         if (episode + 1) % 50 == 0:
             torch.save(model.state_dict(), save_dir / f"model_ep{episode+1}.pt")
 
+        rate_per_client = sum(ep_rates) / sum(traj["n_clients"]) if sum(traj["n_clients"]) > 0 else 0.0
+
         # ── Métricas ──────────────────────────────────────────────────────────
         metrics.append({
-            "episode":        episode + 1,
-            "return":         G_train,
-            "G_val":          G_val,
-            "total_rate":     sum(ep_rates),
-            "loss_actor":     loss_actor.item(),
-            "loss_critic":    loss_critic.item(),
-            "loss":           total_loss.item(),
-            "entropy":        entropies_t.mean().item(),
-            "advantage_mean": advantages.mean().item(),
-            "advantage_std":  advantages.std().item() if len(advantages) > 1 else 0.0,
-            "grad_norm":      grad_norm.item(),
-            "sec":            time.time() - t_global_start,
+            "episode":             episode + 1,
+            "return":              G_train,
+            "G_val":               G_val,
+            "total_rate":          sum(ep_rates),
+            "rate_per_client":     rate_per_client,
+            "val_rate_per_client": val_rate_per_client,
+            "loss_actor":          loss_actor.item(),
+            "loss_critic":         loss_critic.item(),
+            "loss":                total_loss.item(),
+            "entropy":             entropies_t.mean().item(),
+            "advantage_mean":      advantages.mean().item(),
+            "advantage_std":       advantages.std().item() if len(advantages) > 1 else 0.0,
+            "grad_norm":           grad_norm.item(),
+            "sec":                 time.time() - t_global_start,
         })
 
         # Actualizar la interfaz gráfica interactiva en tiempo real (cada episodio)
@@ -500,7 +536,9 @@ def train(args: argparse.Namespace):
                 returns = [m["return"] for m in metrics]
                 val_returns = [m["G_val"] for m in metrics]
                 losses = [m["loss"] for m in metrics]
-                plotter.update(eps, returns, val_returns, losses)
+                rates = [m["rate_per_client"] for m in metrics]
+                val_rates = [m["val_rate_per_client"] for m in metrics]
+                plotter.update(eps, returns, val_returns, losses, rates, val_rates)
             except Exception:
                 pass
 
@@ -508,11 +546,12 @@ def train(args: argparse.Namespace):
             g_val_str = f"{G_val:>10.2f}" if not np.isnan(G_val) else f"{'—':>10}"
             print(
                 f"{episode+1:<6} | "
-                f"{G_train:>10.2f} | "
+                f"{G_train:>11.2f} | "
                 f"{g_val_str} | "
                 f"{loss_actor.item():>9.4f} | "
                 f"{loss_critic.item():>9.4f} | "
-                f"{entropies_t.mean().item():>9.4f}"
+                f"{entropies_t.mean().item():>9.4f} | "
+                f"{time.time() - t_ep:>7.1f}"
             )
             # Guardar CSV temporal y actualizar gráficas en tiempo real
             try:
@@ -563,41 +602,51 @@ def train(args: argparse.Namespace):
     return model, df_metrics
 
 
-def parse_args():
+def parse_args() -> argparse.Namespace:
+    """Configura la interfaz de línea de comandos unificada."""
     p = argparse.ArgumentParser(description="NetROML – A2C + GNN")
-    p.add_argument("--building_id",   default="990",                           type=str)
-    p.add_argument("--dist_joblib",   default="data/distributions_990.joblib", type=str)
-    p.add_argument("--step2_csv",     default="data/dataset_990_step2.csv",    type=str)
-    p.add_argument("--episodes",      type=int,   default=500)
-    p.add_argument("--timesteps",     type=int,   default=100)
-    p.add_argument("--arrival_rate",  type=float, default=2.0)
-    p.add_argument("--mean_dur",      type=float, default=10.0)
-    p.add_argument("--decision_period", type=int, default=1)
-    p.add_argument("--no_5g",         action="store_true", help="Deshabilita el uso de la banda de 5 GHz")
-    p.add_argument("--sticky_mode",   type=str,   default="sticky", choices=["full", "sticky", "lite"])
-    p.add_argument("--hidden",        type=int,   default=64)
-    p.add_argument("--model_type",    type=str,   default="gnn1", choices=["gnn1", "gnn2", "random"])
-    p.add_argument("--num_layers",    type=int,   default=4)
-    p.add_argument("--tagconv_k",     type=int,   default=5, help="Hops K para TAGConv en GNN2")
-    p.add_argument("--reward_scale",  type=float, default=1.0)
-    p.add_argument("--lr",            type=float, default=3e-4,
-                   help="Learning rate del Actor y del backbone GNN compartido.")
-    p.add_argument("--lr_critic",     type=float, default=1e-3,
-                   help="Learning rate de la cabeza Critic (value_head). "
-                        "Debe ser mayor que --lr para que V_phi converja antes "
-                        "que el Actor comience a explotar su señal de ventaja. "
-                        "Ratio recomendado lr_critic/lr ∈ [2, 5].")
-    p.add_argument("--gae_lambda",    type=float, default=0.95,
-                   help="Parámetro Lambda para Generalized Advantage Estimation (GAE).")
-    p.add_argument("--gamma",         type=float, default=0.99)
-    p.add_argument("--entropy_coef",  type=float, default=0.01,
-                   help="Coeficiente para incentivar exploración (bono de entropía).")
-    p.add_argument("--vf_coef",       type=float, default=0.5,
-                   help="Peso del término Critic (L_critic) en la loss total A2C.")
-    p.add_argument("--eval_every",    type=int,   default=20,
-                   help="Frecuencia de episodios de validación sin gradiente.")
-    p.add_argument("--seed",          type=lambda x: None if str(x).lower() == 'none' else int(x), default=314)
-    p.add_argument("--save_dir",      default="outputs/models", type=str)
+    
+    # 1. Configuración de Entorno y Datos
+    p.add_argument("--building_id",     default="990", type=str, help="ID del edificio objetivo.")
+    p.add_argument("--dist_joblib",     default="data/distributions_990.joblib", type=str, help="Path a distributions.joblib.")
+    p.add_argument("--step2_csv",       default="data/dataset_990_step2.csv", type=str, help="Path al dataset step2 CSV.")
+    p.add_argument("--save_dir",        default="outputs/models", type=str, help="Directorio de guardado.")
+    p.add_argument("--seed",            type=lambda x: None if str(x).lower() == 'none' else int(x), default=42, help="Semilla aleatoria.")
+    p.add_argument("--eval_every",      type=int,   default=20, help="Frecuencia de evaluación (A2C/PPO/REINFORCE).")
+
+    # 2. Parámetros del Episodio y Simulación
+    p.add_argument("--episodes",        type=int,   default=500, help="Número de episodios de entrenamiento.")
+    p.add_argument("--timesteps",       type=int,   default=1000, help="Horizonte temporal del episodio (slots).")
+    p.add_argument("--decision_period", type=int,   default=10, help="Periodo de decisión de recursos (slots).")
+    p.add_argument("--arrival_rate",    type=float, default=2.0, help="Tasa de arribo de clientes.")
+    p.add_argument("--mean_dur",        type=float, default=15.0, help="Duración promedio de sesión (slots).")
+    p.add_argument("--no_5g",           action="store_true", help="Deshabilita el uso de la banda de 5 GHz.")
+    p.add_argument("--sticky_mode",     type=str,   default="full", choices=["full", "sticky", "lite"], help="Modo de asociación de cliente.")
+
+    # 3. Parámetros de la Red GNN
+    p.add_argument("--hidden",          type=int,   default=64, help="Dimensión latente de los embeddings.")
+    p.add_argument("--model_type",      type=str,   default="gnn1", choices=["gnn1", "gnn2", "random"], help="Tipo de GNN.")
+    p.add_argument("--num_layers",      type=int,   default=4, help="Número de capas convolucionales.")
+    p.add_argument("--tagconv_k",       type=int,   default=5, help="Hops K para TAGConv en GNN2.")
+
+    # 4. Hiperparámetros de RL Comunes
+    p.add_argument("--reward_scale",    type=float, default=1000.0, help="Escalador de la recompensa física.")
+    p.add_argument("--lr",              type=float, default=3e-4, help="Learning rate del Actor / GNN.")
+    p.add_argument("--gamma",           type=float, default=0.99, help="Factor de descuento gamma.")
+    p.add_argument("--entropy_coef",    type=float, default=0.03, help="Coeficiente para bono de entropía.")
+
+    # 5. Parámetros de Critic y GAE (A2C y PPO)
+    p.add_argument("--lr_critic",     type=float, default=1e-3, help="Learning rate de la cabeza Critic.")
+    p.add_argument("--gae_lambda",    type=float, default=0.95, help="Lambda para GAE.")
+    p.add_argument("--vf_coef",       type=float, default=0.05, help="Peso del término Critic en la loss total.")
+
+    # 6. Parámetros Específicos de PPO
+    p.add_argument("--update_epochs", type=int,   default=4, help="PPO: Épocas de optimización sobre el rollout.")
+    p.add_argument("--minibatch_size",type=int,   default=64, help="PPO: Tamaño de minibatch.")
+    p.add_argument("--clip_coef",     type=float, default=0.2, help="PPO: Coeficiente de clipping de la política.")
+    p.add_argument("--max_grad_norm", type=float, default=0.5, help="PPO/Común: Clipping global de gradiente.")
+    p.add_argument("--norm_adv",       action=argparse.BooleanOptionalAction, default=True, help="PPO: Normalizar ventajas.")
+
     return p.parse_args()
 
 

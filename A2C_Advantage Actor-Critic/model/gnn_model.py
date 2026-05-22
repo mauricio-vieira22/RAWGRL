@@ -24,6 +24,7 @@ class GNN(torch.nn.Module):
         super().__init__()
         self.num_aps = num_aps
         self.num_layers = num_layers
+        self.heads = heads
 
         # 1. Encoders de features crudas
         self.ap_encoder     = Linear(-1, hidden_channels)
@@ -37,7 +38,7 @@ class GNN(torch.nn.Module):
             self.convs.append(HeteroConv({
                 ('ap',     'connects',    'client'): GATv2Conv(in_channels, hidden_channels, heads=heads, add_self_loops=False, edge_dim=1),
                 ('client', 'connected_to', 'ap')  : GATv2Conv(in_channels, hidden_channels, heads=heads, add_self_loops=False),
-                ('ap',     'interferes',  'ap')    : GATv2Conv(in_channels, hidden_channels, heads=heads, add_self_loops=False, edge_dim=1),
+                ('ap',     'interferes',  'ap')    : GATv2Conv(in_channels, hidden_channels, heads=heads, add_self_loops=False, edge_dim=2),
             }, aggr='sum'))
 
         # 3. Cabezas de política y valor
@@ -78,22 +79,38 @@ class GNN(torch.nn.Module):
             x_new = {k: F.elu(v.nan_to_num(0.0)) for k, v in x_new.items()}
             
             if i > 0:
-                x = {k: x_new[k] + x[k] for k in x.keys()}
+                # Conexión residual compatible
+                x = {
+                    k: x_new[k] + x[k]
+                    for k in x_new
+                    if k in x and x_new[k].shape == x[k].shape
+                }
+                for k in x_new:
+                    if k not in x:
+                        x[k] = x_new[k]
             else:
-                x = x_new
+                # Conexión residual de primera capa repeat compatible
+                x = {
+                    k: x_new[k] + x[k].repeat(1, self.heads)
+                    for k in x_new
+                    if k in x and x_new[k].shape == x[k].repeat(1, self.heads).shape
+                }
+                for k in x_new:
+                    if k not in x:
+                        x[k] = x_new[k]
 
         # 3. Cabezas de política
         ap_emb = x['ap']
         channel_logits = self.channel_head(ap_emb).nan_to_num(nan=0.0)
         power_logits   = self.power_head(ap_emb).nan_to_num(nan=0.0)
 
-        # 4. Cabeza de Valor (Critic)
+        # 4. Cabeza de Valor (Critic) con desacoplamiento (detach) para evitar shared backbone interference
         if batch_dict is not None and 'ap' in batch_dict:
             from torch_geometric.nn import global_mean_pool
             graph_emb = global_mean_pool(ap_emb, batch_dict['ap'])
         else:
             graph_emb = ap_emb.mean(dim=0, keepdim=True)
 
-        state_value = self.value_head(graph_emb).nan_to_num(nan=0.0)
+        state_value = self.value_head(graph_emb.detach()).nan_to_num(nan=0.0)
 
         return channel_logits, power_logits, state_value

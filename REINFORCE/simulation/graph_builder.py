@@ -189,10 +189,11 @@ def construir_grafo_timestep(
     ap_src, ap_dst = torch.where(A > 0)
     if len(ap_src) > 0:
         data['ap', 'interferes', 'ap'].edge_index = torch.stack([ap_src, ap_dst], dim=0)
-        # Normalizamos el peso por el número de clientes activos
-        data['ap', 'interferes', 'ap'].edge_attr = (A[ap_src, ap_dst] / n_activos).unsqueeze(1)
+        covis = A[ap_src, ap_dst] / n_activos
+        mismo_canal = (canal_idx[ap_src] == canal_idx[ap_dst]).float()
+        data['ap', 'interferes', 'ap'].edge_attr = torch.stack([covis, mismo_canal], dim=1)
     else:
         data['ap', 'interferes', 'ap'].edge_index = torch.empty((2, 0), dtype=torch.long, device=dev)
-        data['ap', 'interferes', 'ap'].edge_attr = torch.empty((0, 1), dtype=torch.float32, device=dev)
+        data['ap', 'interferes', 'ap'].edge_attr = torch.empty((0, 2), dtype=torch.float32, device=dev)
 
     return data

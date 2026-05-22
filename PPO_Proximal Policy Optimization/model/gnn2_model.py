@@ -142,7 +142,8 @@ class GNN2(torch.nn.Module):
                 edges.append(ei_ap_ap)
                 if edge_attr_dict and ('ap', 'interferes', 'ap') in edge_attr_dict:
                     attr = edge_attr_dict[('ap', 'interferes', 'ap')]
-                    if attr.dim() > 1: attr = attr.squeeze(-1)
+                    if attr.dim() > 1:
+                        attr = attr[:, 0]
                     attrs.append(attr)
                 else: attrs.append(torch.ones(num_edges, device=device))
 
@@ -165,13 +166,13 @@ class GNN2(torch.nn.Module):
         channel_logits = self.channel_head(ap_emb).nan_to_num(0.0)
         power_logits = self.power_head(ap_emb).nan_to_num(0.0)
 
-        # Critic (V)
+        # Critic (V) con desacoplamiento (detach) para evitar shared backbone interference
         if batch_dict is not None and 'ap' in batch_dict:
             from torch_geometric.nn import global_mean_pool
             graph_emb = global_mean_pool(ap_emb, batch_dict['ap'])
         else:
             graph_emb = ap_emb.mean(dim=0, keepdim=True)
 
-        state_value = self.value_head(graph_emb).nan_to_num(0.0)
+        state_value = self.value_head(graph_emb.detach()).nan_to_num(0.0)
 
         return channel_logits, power_logits, state_value

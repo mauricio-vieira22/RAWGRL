@@ -59,11 +59,19 @@ def plot_metrics(csv_path, output_dir=None):
     # 3. Total Rate (Throughput)
     ax = axes[2]
     ax.plot(df['episode'], df['total_rate'], color='green', alpha=0.2)
-    ax.plot(df['episode'], df['total_rate'].rolling(window=window).mean(), color='green', linewidth=1.5, label='Throughput')
-    ax.set_title("Network Throughput: Spectral Efficiency")
+    ax.plot(df['episode'], df['total_rate'].rolling(window=window).mean(), color='green', linewidth=1.5, label='Aggregate Throughput')
+    ax.set_title("Network Throughput & Rate per Client")
     ax.set_xlabel("Episode")
-    ax.set_ylabel("Bits/s/Hz (Aggregate)")
+    ax.set_ylabel("Bits/s/Hz (Aggregate)", color='green')
+    ax.tick_params(axis='y', labelcolor='green')
     ax.grid(True)
+
+    if 'rate_per_client' in df.columns:
+        ax2 = ax.twinx()
+        ax2.plot(df['episode'], df['rate_per_client'], color='teal', alpha=0.2)
+        ax2.plot(df['episode'], df['rate_per_client'].rolling(window=window).mean(), color='teal', linewidth=1.2, linestyle='--', label='Throughput / Client')
+        ax2.set_ylabel("Bits/s/Hz (per Client)", color='teal')
+        ax2.tick_params(axis='y', labelcolor='teal')
 
     # 4. Entropy
     ax = axes[3]
