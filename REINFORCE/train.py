@@ -166,7 +166,7 @@ def evaluate_policy(
     device:       torch.device,
     gamma:        float,
     reward_scale: float = 1.0,
-) -> tuple[float, float]:
+) -> tuple[float, float, float]:
     """
     Evalúa la política de forma determinista (argmax) con semilla fija.
 
@@ -392,16 +392,19 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         ).to(device)
 
     optimizer = optim.AdamW(model.parameters(), lr=args.lr)
-    scheduler = optim.lr_scheduler.CosineAnnealingLR(optimizer, T_max=args.episodes)
+    scheduler = optim.lr_scheduler.CosineAnnealingLR(
+        optimizer, T_max=args.episodes, eta_min=1e-5
+    )
 
     save_dir = Path(args.save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
 
     # 4. Estado del entrenamiento
     best_return  = -float("inf")
-    # Baseline EMA con β = 0.99: vida media ≈ 69 episodios.
-    # Inicializado en None; se establece con el primer retorno observado.
-    baseline_ema: torch.Tensor | None = None
+    # Baseline EMA escalar con β = 0.99: vida media ≈ 69 episodios.
+    # Un baseline escalar (EMA de G_0) es el estándar de REINFORCE.
+    # La versión anterior usaba un vector per-timestep que corrompía las ventajas.
+    baseline_ema: float | None = None
     beta_ema = 0.99
 
     metrics_log: list[dict] = []
@@ -424,8 +427,10 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
 
     # 5. Bucle principal REINFORCE
     for episode in range(args.episodes):
-        ep_seed = args.seed + episode if args.seed is not None else None
-        obs, _  = env.reset(seed=ep_seed)
+        # No pasar semilla al env de entrenamiento: torch.manual_seed() dentro
+        # del env reseteaba el RNG de Categorical.sample(), destruyendo la
+        # exploración estocástica de la política.
+        obs, _  = env.reset(seed=None)
 
         log_probs_list: list[torch.Tensor] = []
         entropies_list: list[torch.Tensor] = []
@@ -448,11 +453,13 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
             ch_acts  = ch_dist.sample()
             pwr_acts = pwr_dist.sample()
 
+            # mean() por AP en vez de sum(): evita que la magnitud del gradiente
+            # escale linealmente con N (número de APs).
             log_probs_list.append(
-                ch_dist.log_prob(ch_acts).sum() + pwr_dist.log_prob(pwr_acts).sum()
+                ch_dist.log_prob(ch_acts).mean() + pwr_dist.log_prob(pwr_acts).mean()
             )
             entropies_list.append(
-                ch_dist.entropy().sum() + pwr_dist.entropy().sum()
+                ch_dist.entropy().mean() + pwr_dist.entropy().mean()
             )
 
             action = torch.stack([ch_acts, pwr_acts], dim=1)
@@ -466,10 +473,12 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
             n_clients_list.append(n_active)
             ep_rates.append(info.get("total_rate", 0.0))
 
-        # Rewards normalizados por cliente y por reward_scale
+        # Rewards normalizados por cliente activo (sin reward_scale).
+        # La normalización de ventajas posterior elimina el sesgo de escala
+        # absoluta, por lo que dividir adicionalmente por reward_scale
+        # solo aplastaba la señal útil.
         rewards_scaled = [
-            r / n / args.reward_scale
-            for r, n in zip(rewards_raw, n_clients_list)
+            r / n for r, n in zip(rewards_raw, n_clients_list)
         ]
 
         # Retornos descontados G_t (reward-to-go)
@@ -477,20 +486,14 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
         G_0     = returns[0].item()
         seq_len = len(returns)
 
-        # Actualización del baseline EMA
+        # Actualización del baseline EMA escalar (Williams, 1992)
         if baseline_ema is None:
-            baseline_ema = returns.clone()
+            baseline_ema = G_0
         else:
-            # Ajuste dinámico de longitud si el episodio cambia de tamaño
-            if baseline_ema.shape[0] < seq_len:
-                pad = returns[baseline_ema.shape[0]:].clone()
-                baseline_ema = torch.cat([baseline_ema, pad])
-            baseline_ema[:seq_len] = (
-                beta_ema * baseline_ema[:seq_len] + (1.0 - beta_ema) * returns
-            )
+            baseline_ema = beta_ema * baseline_ema + (1.0 - beta_ema) * G_0
 
-        # Ventajas: A_t = G_t - b_t, estandarizadas (centrado + escalado)
-        advantages = normalize_advantages(returns - baseline_ema[:seq_len])
+        # Ventajas: A_t = G_t - b, estandarizadas (centrado + escalado)
+        advantages = normalize_advantages(returns - baseline_ema)
 
         # Pérdida REINFORCE: L = -E[Â_t · log π(a_t|s_t)] - α_H · H[π]
         log_probs_t = torch.stack(log_probs_list)
@@ -532,7 +535,7 @@ def train(args: argparse.Namespace) -> tuple[GNN, pd.DataFrame]:
             "episode":             episode + 1,
             "return":              G_0,
             "G_val":               G_val,
-            "baseline":            baseline_ema[0].item() if baseline_ema is not None else 0.0,
+            "baseline":            baseline_ema if baseline_ema is not None else 0.0,
             "total_rate":          sum(ep_rates),
             "val_rate":            val_rate,
             "rate_per_client":     rate_per_client,
@@ -621,12 +624,12 @@ def parse_args() -> argparse.Namespace:
     p = argparse.ArgumentParser(description="NetROML: REINFORCE WiFi Resource Allocation")
     
     # 1. Configuración de Entorno y Datos
-    p.add_argument("--building_id",     default="814", type=str, help="ID del edificio objetivo.")
-    p.add_argument("--dist_joblib",     default="data/distributions_814.joblib", type=str, help="Path a distributions.joblib.")
-    p.add_argument("--step2_csv",       default="data/dataset_814_step2.csv", type=str, help="Path al dataset step2 CSV.")
+    p.add_argument("--building_id",     default="990", type=str, help="ID del edificio objetivo.")
+    p.add_argument("--dist_joblib",     default="data/distributions_990.joblib", type=str, help="Path a distributions.joblib.")
+    p.add_argument("--step2_csv",       default="data/dataset_990_step2.csv", type=str, help="Path al dataset step2 CSV.")
     p.add_argument("--save_dir",        default="outputs/models", type=str, help="Directorio de guardado.")
-    p.add_argument("--seed",            type=lambda x: None if str(x).lower() == 'none' else int(x), default=2026, help="Semilla aleatoria.")
-    p.add_argument("--eval_every",      type=int,   default=20, help="Frecuencia de evaluación (A2C/PPO/REINFORCE).")
+    p.add_argument("--seed",            type=lambda x: None if str(x).lower() == 'none' else int(x), default=42, help="Semilla aleatoria.")
+    p.add_argument("--eval_every",      type=int,   default=10, help="Frecuencia de evaluación (A2C/PPO/REINFORCE).")
 
     # 2. Parámetros del Episodio y Simulación
     p.add_argument("--episodes",        type=int,   default=500, help="Número de episodios de entrenamiento.")
@@ -647,7 +650,7 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--reward_scale",    type=float, default=1000.0, help="Escalador de la recompensa física.")
     p.add_argument("--lr",              type=float, default=3e-4, help="Learning rate del Actor / GNN.")
     p.add_argument("--gamma",           type=float, default=0.99, help="Factor de descuento gamma.")
-    p.add_argument("--entropy_coef",    type=float, default=0.03, help="Coeficiente para bono de entropía.")
+    p.add_argument("--entropy_coef",    type=float, default=0.005, help="Coeficiente para bono de entropía.")
 
     # 5. Parámetros de Critic y GAE (A2C y PPO)
     p.add_argument("--lr_critic",     type=float, default=1e-3, help="Learning rate de la cabeza Critic.")
